@@ -215,6 +215,7 @@
     </main>
 
     <script>
+        const API_BASE_URL = window.location.protocol === 'file:' ? 'http://127.0.0.1:8000' : '';
         let evaluatedCompanies = [];
         /*
             {
@@ -313,7 +314,7 @@
             const formData = new FormData();
             formData.append('file', document.getElementById('resumeFile').files[0]);
             formData.append('user_id', 1);
-            const res = await fetch('/api/v1/parse-resume-pdf', { method: 'POST', body: formData });
+            const res = await fetch(`${API_BASE_URL}/api/v1/parse-resume-pdf`, { method: 'POST', body: formData });
             const data = await res.json();
             const resDiv = document.getElementById('resumeResult');
             resDiv.classList.remove('hidden');
@@ -334,7 +335,7 @@
             formData.append('resume_id', resumeId);
             formData.append('country', document.getElementById('marketCountry').value || 'India');
             
-            const res = await fetch('/api/v1/market/discover', { method: 'POST', body: formData });
+            const res = await fetch(`${API_BASE_URL}/api/v1/market/discover`, { method: 'POST', body: formData });
             const data = await res.json();
             
             evaluatedCompanies = data.jobs.map(j => ({
@@ -373,7 +374,7 @@
             const formData = new FormData();
             formData.append('resume_id', document.getElementById('matchResumeId').value);
             formData.append('job_id', document.getElementById('matchJobId').value);
-            const res = await fetch('/api/v1/evaluate-matches', { method: 'POST', body: formData });
+            const res = await fetch(`${API_BASE_URL}/api/v1/evaluate-matches`, { method: 'POST', body: formData });
             const data = await res.json();
             renderEvaluationData(data);
         });

@@ -60,3 +60,29 @@ def test_repeated_discovery_uses_cache():
 
     assert agent.last_cache_hit is True
     assert agent.request_count == 1
+
+
+def test_devops_resume_keeps_devops_signal_in_source_query():
+    agent = MarketDiscoveryAgent(sources=[])
+    terms = agent._candidate_terms(
+        ["python", "kubernetes", "terraform"],
+        "DevOps Engineer in Hyderabad, India",
+    )
+
+    assert "devops" in terms
+    assert agent._search_query(terms).startswith("devops engineer")
+
+
+def test_bare_remote_listing_is_not_assumed_to_be_in_india():
+    agent = MarketDiscoveryAgent(sources=[])
+    remote_job = {
+        "location": "Remote",
+        "remote": True,
+    }
+    worldwide_job = {
+        "location": "Worldwide remote",
+        "remote": True,
+    }
+
+    assert agent._matches_country(remote_job, "India") is False
+    assert agent._matches_country(worldwide_job, "India") is True

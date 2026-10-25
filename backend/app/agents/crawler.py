@@ -95,7 +95,6 @@ class MarketDiscoveryAgent:
             "pagination": "page",
             "query_param": "q",
             "country_param": "country",
-            "worldwide_param": "worldwide",
             "page_size": 20,
         },
     )
@@ -107,7 +106,15 @@ class MarketDiscoveryAgent:
         "human resources", "recruiter", "operations", "research", "product",
         "project", "security", "data", "qa", "tester", "support", "writer",
         "editor", "teacher", "nurse", "medical", "intern", "executive",
+        "devops", "sre", "site reliability", "platform", "cloud",
+        "infrastructure", "mlops", "gitops", "release engineering",
     }
+
+    ROLE_QUERY_PRIORITY = (
+        "devops", "site reliability", "sre", "platform", "cloud",
+        "infrastructure", "mlops", "gitops", "release engineering",
+        "developer", "engineer", "analyst", "designer", "manager",
+    )
 
     def __init__(self, sources: list[dict[str, str]] | None = None, timeout: float = 8.0):
         self.sources = sources or self._configured_sources()
@@ -288,7 +295,12 @@ class MarketDiscoveryAgent:
         """Build a short source query while preserving role and skill signals."""
         role_terms = sorted(
             (term for term in candidate_terms if term in cls.ROLE_TERMS),
-            key=lambda term: (-len(term), term),
+            key=lambda term: (
+                cls.ROLE_QUERY_PRIORITY.index(term)
+                if term in cls.ROLE_QUERY_PRIORITY else len(cls.ROLE_QUERY_PRIORITY),
+                -len(term),
+                term,
+            ),
         )
         skill_terms = sorted(
             (term for term in candidate_terms if term not in cls.ROLE_TERMS),
@@ -370,7 +382,10 @@ class MarketDiscoveryAgent:
     def _candidate_terms(cls, candidate_skills: list | set, resume_text: str) -> set[str]:
         terms = {str(skill).lower() for skill in candidate_skills if str(skill).strip()}
         resume_lower = resume_text.lower()
-        terms.update(term for term in cls.ROLE_TERMS if term in resume_lower)
+        terms.update(
+            term for term in cls.ROLE_TERMS
+            if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", resume_lower)
+        )
         if not terms and resume_text.strip():
             words = re.findall(r"[a-z][a-z+#.-]{2,}", resume_lower)
             stop_words = {"with", "from", "that", "this", "years", "experience", "and", "the"}
@@ -409,11 +424,12 @@ class MarketDiscoveryAgent:
             record.get("description") or record.get("excerpt") or record.get("summary")
         )
         description = " ".join(BeautifulSoup(description, "html.parser").get_text(" ").split())
+        restrictions = record.get("locationRestrictions")
         location_value = (
             record.get("location")
             or record.get("candidate_required_location")
             or record.get("locations")
-            or record.get("locationRestrictions")
+            or restrictions
         )
         if isinstance(location_value, list) and all(isinstance(item, dict) for item in location_value):
             location = ", ".join(
@@ -422,6 +438,8 @@ class MarketDiscoveryAgent:
             ).strip(", ")
         else:
             location = self._text(location_value).strip()
+        if source_name.lower() == "himalayas" and not location:
+            location = "Worldwide remote"
         remote = bool(record.get("remote")) or source_name.lower() == "himalayas" or "remote" in f"{location} {title}".lower()
         full_text = f"{title} {description}"
         weights = {
@@ -488,7 +506,7 @@ class MarketDiscoveryAgent:
             return True
         if cls._matches_country_text(location, country):
             return True
-        return location in {"location not specified", "remote"}
+        return False
 
     @staticmethod
     def _relevance(job: dict[str, Any], terms: set[str]) -> int:
