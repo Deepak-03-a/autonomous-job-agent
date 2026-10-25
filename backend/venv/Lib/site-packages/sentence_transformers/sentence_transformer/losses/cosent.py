@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+
+from sentence_transformers import util
+from sentence_transformers.base.losses.merged_forward import embed_columns
+from sentence_transformers.sentence_transformer.model import SentenceTransformer
+
+
+class CoSENTLoss(nn.Module):
+    def __init__(self, model: SentenceTransformer, scale: float = 20.0, similarity_fct=util.pairwise_cos_sim) -> None:
+        """
+        This class implements CoSENT (Consistent SENTence embedding) loss.
+        It expects that each of the inputs consists of a pair of inputs (e.g., texts) and a float valued label,
+        representing the expected similarity score between the pair.
+
+        It computes the following loss function:
+
+        ``loss = log(1 + sum(exp(scale * (s(k,l) - s(i,j)))))``, where ``s`` is the score returned by
+        ``similarity_fct``. The sum is over all pairs of input pairs in the batch such that the similarity label of
+        ``(i,j)`` is greater than that of ``(k,l)``.
+
+        Anecdotal experiments show that this loss function produces a more powerful training signal than :class:`CosineSimilarityLoss`,
+        resulting in faster convergence and a final model with superior performance. Consequently, CoSENTLoss may be used
+        as a drop-in replacement for :class:`CosineSimilarityLoss` in any training script.
+
+        Args:
+            model: SentenceTransformerModel
+            similarity_fct: Function to compute the PAIRWISE similarity
+                between embeddings. Default is
+                ``util.pairwise_cos_sim``.
+            scale: Output of similarity function is multiplied by scale
+                value. Represents the inverse temperature.
+
+        References:
+            - For further details, see: https://penghao-bdsc.github.io/papers/CoSENT_TASLP2024.pdf
+
+        Requirements:
+            - Input pairs with corresponding similarity scores in range of the similarity function. Default is [-1,1].
+
+        Inputs:
+            +--------------------------------+------------------------+
+            | Inputs                         | Labels                 |
+            +================================+========================+
+            | (input_A, input_B) pairs       | float similarity score |
+            +--------------------------------+------------------------+
+
+        Relations:
+            - :class:`AnglELoss` is CoSENTLoss with ``pairwise_angle_sim`` as the metric, rather than ``pairwise_cos_sim``.
+            - :class:`CosineSimilarityLoss` seems to produce a weaker training signal than CoSENTLoss. In our experiments, CoSENTLoss is recommended.
+
+        Example:
+            ::
+
+                from sentence_transformers import SentenceTransformer, SentenceTransformerTrainer, losses
+                from datasets import Dataset
+
+                model = SentenceTransformer("microsoft/mpnet-base")
+                train_dataset = Dataset.from_dict({
+                    "sentence1": ["It's nice weather outside today.", "He drove to work."],
+                    "sentence2": ["It's so sunny.", "She walked to the store."],
+                    "score": [1.0, 0.3],
+                })
+                loss = losses.CoSENTLoss(model)
+
+                trainer = SentenceTransformerTrainer(
+                    model=model,
+                    train_dataset=train_dataset,
+                    loss=loss,
+                )
+                trainer.train()
+        """
+        super().__init__()
+        self.model = model
+        self.similarity_fct = similarity_fct
+        self.scale = scale
+
+    def forward(self, sentence_features: Iterable[dict[str, Tensor]], labels: Tensor) -> Tensor:
+        embeddings = embed_columns(self.model, sentence_features)
+
+        return self.compute_loss_from_embeddings(embeddings, labels)
+
+    def compute_loss_from_embeddings(self, embeddings: list[Tensor], labels: Tensor) -> Tensor:
+        """
+        Compute the CoSENT loss from embeddings.
+
+        Args:
+            embeddings: List of embeddings
+            labels: Labels indicating the similarity scores of the pairs
+
+        Returns:
+            Loss value
+        """
+        batch_size = embeddings[0].shape[0]
+        if labels.numel() != batch_size:
+            raise ValueError(
+                f"{self.__class__.__name__} expects {batch_size} labels (one per example), "
+                f"but got {labels.numel()} labels with shape {tuple(labels.shape)}."
+            )
+        labels = labels.view(-1)
+
+        scores = self.similarity_fct(embeddings[0], embeddings[1])
+        if labels.shape != scores.shape:
+            raise ValueError(f"Labels and scores must have the same shape, got {labels.shape} and {scores.shape}.")
+        if scores.dtype in (torch.float16, torch.bfloat16):
+            scores = scores.float()
+        scores = scores * self.scale
+        if labels.dtype == torch.bool:
+            labels = labels.int()
+
+        labels, order = labels.sort()
+        scores = scores[order]
+        # For each score, sum exp(-score) over strictly higher labels. Group boundaries
+        # exclude ties, and logcumsumexp avoids materializing the quadratic score matrix.
+        higher_label_start = torch.searchsorted(labels, labels, right=True)
+        suffix_scores = torch.logcumsumexp(-scores.flip(0), dim=0).flip(0)
+        suffix_scores = torch.cat((suffix_scores, scores.new_full((1,), -torch.inf)))
+        scores = scores + suffix_scores[higher_label_start]
+
+        # append a zero as e^0 = 1
+        scores = torch.cat((scores.new_zeros(1), scores), dim=0)
+        loss = torch.logsumexp(scores, dim=0)
+
+        return loss
+
+    def get_config_dict(self) -> dict[str, Any]:
+        return {"scale": self.scale, "similarity_fct": self.similarity_fct.__name__}
+
+    @property
+    def citation(self) -> str:
+        return """
+@article{10531646,
+    author={Huang, Xiang and Peng, Hao and Zou, Dongcheng and Liu, Zhiwei and Li, Jianxin and Liu, Kay and Wu, Jia and Su, Jianlin and Yu, Philip S.},
+    journal={IEEE/ACM Transactions on Audio, Speech, and Language Processing},
+    title={CoSENT: Consistent Sentence Embedding via Similarity Ranking},
+    year={2024},
+    doi={10.1109/TASLP.2024.3402087}
+}
+"""

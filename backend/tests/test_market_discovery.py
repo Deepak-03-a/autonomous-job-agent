@@ -1,0 +1,62 @@
+from app.agents.crawler import MarketDiscoveryAgent
+from app.agents.parser import extract_skills_from_text
+
+
+class FakeMarketDiscoveryAgent(MarketDiscoveryAgent):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.request_count = 0
+
+    def _request_json(self, url, params):
+        self.request_count += 1
+        return {
+            "data": [
+                {
+                    "title": f"Python Developer {index}",
+                    "company_name": f"Employer {index}",
+                    "url": f"https://jobs.example.test/{index}",
+                    "location": "Bengaluru, India",
+                    "description": "Build Python services for a growing product team.",
+                    "is_startup": index == 6,
+                }
+                for index in range(1, 7)
+            ]
+        }
+
+
+def test_discovery_has_no_five_job_cap_and_keeps_startups():
+    agent = FakeMarketDiscoveryAgent(
+        sources=[{"name": "Test feed", "url": "https://jobs.example.test/feed"}]
+    )
+
+    jobs = agent.discover_market_jobs(
+        candidate_skills=["python"],
+        candidate_years=1.0,
+        resume_text="Python Developer",
+        country="India",
+    )
+
+    assert len(jobs) == 6
+    assert any(job["is_startup"] for job in jobs)
+
+
+def test_unknown_resume_does_not_get_devops_fallback_skills():
+    assert extract_skills_from_text("Marketing manager with campaign strategy experience") == []
+
+
+def test_repeated_discovery_uses_cache():
+    agent = FakeMarketDiscoveryAgent(
+        sources=[{"name": "Test feed", "url": "https://jobs.example.test/feed"}]
+    )
+    arguments = {
+        "candidate_skills": ["python"],
+        "candidate_years": 1.0,
+        "resume_text": "Python Developer",
+        "country": "India",
+    }
+
+    agent.discover_market_jobs(**arguments)
+    agent.discover_market_jobs(**arguments)
+
+    assert agent.last_cache_hit is True
+    assert agent.request_count == 1
