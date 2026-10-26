@@ -384,7 +384,7 @@ class MarketDiscoveryAgent:
         resume_lower = resume_text.lower()
         terms.update(
             term for term in cls.ROLE_TERMS
-            if re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", resume_lower)
+            if re.search(r"(?<![\w-])" + re.escape(term) + r"(?![\w-])", resume_lower)
         )
         if not terms and resume_text.strip():
             words = re.findall(r"[a-z][a-z+#.-]{2,}", resume_lower)
@@ -510,8 +510,16 @@ class MarketDiscoveryAgent:
 
     @staticmethod
     def _relevance(job: dict[str, Any], terms: set[str]) -> int:
+        """Count whole-term hits so java does not match javascript, or go match google."""
         searchable = f"{job['title']} {job['description']}".lower()
-        return sum(1 for term in terms if term in searchable)
+        hits = 0
+        for term in terms:
+            needle = str(term).lower().strip()
+            if len(needle) < 2:
+                continue
+            if re.search(r"(?<![\w-])" + re.escape(needle) + r"(?![\w-])", searchable):
+                hits += 1
+        return hits
 
 
 class DOMPruningCrawlerAgent(EthicalCrawlerAgent):
