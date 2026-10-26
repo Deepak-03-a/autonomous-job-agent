@@ -86,7 +86,7 @@
                 <!-- 3. Hybrid Alignment Evaluation -->
                 <div class="bg-slate-900/90 backdrop-blur border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <h3 class="text-sm font-bold uppercase tracking-wider text-blue-400">3. Hybrid Alignment Evaluation</h3>
-                    <p class="text-xs text-slate-400">Calculates deterministic match scores considering candidate experience, required experience, and weighted NER skill overlap.</p>
+                    <p class="text-xs text-slate-400">Ranks every discovered opening, then shows the one skill that would raise each score.</p>
                     
                     <form id="matchForm" class="space-y-4">
                         <div class="grid grid-cols-2 gap-4">
@@ -144,6 +144,9 @@
                         </div>
                     </div>
 
+                    <p id="scoreStory" class="text-xs text-slate-400">The score breakdown appears after a market ranking.</p>
+                    <p id="nextSkillCallout" class="text-xs text-amber-300">The highest-leverage missing skill will appear here.</p>
+
                     <!-- 4 Mathematical Telemetry Cards -->
                     <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
                         <div class="bg-slate-950/90 border border-slate-800 p-4 rounded-xl text-center shadow-inner">
@@ -196,17 +199,12 @@
                         <h4 class="text-sm font-bold uppercase tracking-wider text-amber-400">Live Market Company Application Directory</h4>
                         <span id="companyCountBadge" class="text-xs text-slate-400 bg-slate-800 px-2.5 py-1 rounded-lg border border-slate-700">0 Openings Indexed</span>
                     </div>
+                    <div id="marketBrief" class="hidden bg-slate-950/80 border border-amber-500/20 rounded-xl p-4 space-y-2">
+                        <p id="marketBriefSummary" class="text-xs text-slate-200 leading-relaxed"></p>
+                        <div id="marketBriefLevers" class="flex flex-wrap gap-2"></div>
+                    </div>
                     <div id="companyDirectoryList" class="space-y-3">
-                        <div class="bg-slate-950/80 border border-slate-800 p-4 rounded-xl flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-                            <div>
-                                <span class="text-xs font-extrabold text-white block">Capgemini India — Cloud & DevOps Engineer</span>
-                                <a href="https://www.instahyre.com/job-id-aws-cloud-devops-engineer-capgemini-bangalore" target="_blank" class="text-[10px] text-amber-400 hover:underline font-mono">https://www.instahyre.com/job-id-aws-cloud-devops-engineer-capgemini-bangalore</a>
-                            </div>
-                            <div class="flex items-center gap-3">
-                                <span class="text-xs font-black text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-lg border border-emerald-500/20">91.50% Match</span>
-                                <a href="https://www.instahyre.com/job-id-aws-cloud-devops-engineer-capgemini-bangalore" target="_blank" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-4 py-2 rounded-lg transition shadow">Apply Now</a>
-                            </div>
-                        </div>
+                        <div class="text-xs text-slate-500">Run a nationwide scan to rank matching openings.</div>
                     </div>
                 </div>
 
@@ -216,66 +214,61 @@
 
     <script>
         const API_BASE_URL = window.location.protocol === 'file:' ? 'http://127.0.0.1:8000' : '';
-        let evaluatedCompanies = [];
-        /*
-            {
-                company_name: "Capgemini India",
-                role_title: "Cloud & DevOps Engineer",
-                portal_url: "https://www.instahyre.com/job-id-aws-cloud-devops-engineer-capgemini-bangalore",
-                score: 91.50,
-                tier: "Tier 1: High Match"
-            },
-            {
-                company_name: "IBM India",
-                role_title: "Junior DevOps Engineer / Trainee",
-                portal_url: "https://www.ibm.com/careers/in-en/search?q=DevOps",
-                score: 87.20,
-                tier: "Tier 1: High Match"
-            },
-            {
-                company_name: "Wipro Limited",
-                role_title: "Cloud Infrastructure & SRE Engineer",
-                portal_url: "https://careers.wipro.com/careers-home/",
-                score: 85.00,
-                tier: "Tier 1: High Match"
-            },
-            {
-                company_name: "TrueFoundry",
-                role_title: "Senior SRE / DevOps Engineer",
-                portal_url: "https://wellfound.com/company/truefoundry/jobs",
-                score: 89.40,
-                tier: "Tier 1: High Match"
-            },
-            {
-                company_name: "ValueLabs",
-                role_title: "Cloud DevOps Engineer",
-                portal_url: "https://www.valuelabs.com/careers/",
-                score: 83.10,
-                tier: "Tier 1: High Match"
+        let rankedMatches = [];
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[ch]));
+        }
+
+        function safeUrl(url) {
+            if (!url || url === '#') return '#';
+            try {
+                const parsed = new URL(url, window.location.origin);
+                if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.href;
+            } catch (error) {
+                return '#';
             }
-        */
+            return '#';
+        }
+
+        function tierClass(tier) {
+            if ((tier || '').includes('Tier 1')) return 'text-emerald-300 bg-emerald-500/10 border-emerald-500/30';
+            if ((tier || '').includes('Tier 2')) return 'text-blue-300 bg-blue-500/10 border-blue-500/30';
+            if ((tier || '').includes('Tier 3')) return 'text-amber-300 bg-amber-500/10 border-amber-500/30';
+            return 'text-slate-300 bg-slate-800 border-slate-700';
+        }
 
         function renderCompanyDirectory() {
             const listEl = document.getElementById('companyDirectoryList');
-            document.getElementById('companyCountBadge').innerText = `${evaluatedCompanies.length} Openings Indexed`;
-            if (!evaluatedCompanies.length) {
-                listEl.innerHTML = '<div class="text-xs text-slate-500">Run a nationwide scan to load all matching openings.</div>';
+            document.getElementById('companyCountBadge').innerText = `${rankedMatches.length} Openings Ranked`;
+            if (!rankedMatches.length) {
+                listEl.innerHTML = '<div class="text-xs text-slate-500">Run a nationwide scan to rank matching openings.</div>';
                 return;
             }
-            listEl.innerHTML = evaluatedCompanies.map(c => `
-                <div class="bg-slate-950/80 border border-slate-800 p-4 rounded-xl flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+            listEl.innerHTML = rankedMatches.map((match, index) => {
+                const company = match.company_details || {};
+                const evaluation = match.evaluation || {};
+                const nextSkill = evaluation.best_next_skill;
+                const href = safeUrl(company.portal_url);
+                const lift = nextSkill
+                    ? `Learning ${escapeHtml(nextSkill.skill)} adds +${escapeHtml(nextSkill.score_lift_pct)} pts`
+                    : escapeHtml(evaluation.experience_fit || 'No listed skill gap');
+                return `
+                <div data-match-index="${index}" class="w-full text-left bg-slate-950/80 border border-slate-800 hover:border-amber-500/40 p-4 rounded-xl flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 cursor-pointer">
                     <div>
-                        <span class="text-xs font-extrabold text-white block">${c.company_name} — ${c.role_title}</span>
-                        <span class="text-[10px] text-slate-400 block">${c.location || 'Location not specified'}${c.is_startup ? ' · Startup' : ''}</span>
-                        <a href="${c.source_url || '#'}" target="_blank" class="text-[10px] text-slate-500 hover:underline block">Source: ${c.source || 'Job feed'}</a>
-                        <a href="${c.portal_url}" target="_blank" class="text-[10px] text-amber-400 hover:underline font-mono">${c.portal_url}</a>
+                        <span class="text-xs font-extrabold text-white block">${escapeHtml(company.company_name)} — ${escapeHtml(company.role_title)}</span>
+                        <span class="text-[10px] text-slate-400 block">${escapeHtml(company.location || 'Location not specified')}${company.is_startup ? ' · Startup' : ''} · ${escapeHtml(evaluation.application_queue || evaluation.experience_fit || '')}</span>
+                        <span class="text-[10px] text-amber-300 block">${lift}</span>
+                        <a href="${href}" target="_blank" class="text-[10px] text-amber-400 hover:underline font-mono">${escapeHtml(company.portal_url || '')}</a>
                     </div>
                     <div class="flex items-center gap-3">
-                        <span class="text-xs font-black text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-lg border border-emerald-500/20">${c.relevance_score || 0} relevance</span>
-                        <a href="${c.portal_url}" target="_blank" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-4 py-2 rounded-lg transition shadow">Apply Now</a>
+                        <span class="text-xs font-black px-2.5 py-1 rounded-lg border ${tierClass(evaluation.match_tier)}">${escapeHtml(evaluation.final_match_score_pct)}% · ${escapeHtml(evaluation.match_tier || '')}</span>
+                        <a href="${href}" target="_blank" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-4 py-2 rounded-lg transition shadow">Apply Now</a>
                     </div>
-                </div>
-            `).join('');
+                </div>`;
+            }).join('');
         }
 
         renderCompanyDirectory();
@@ -286,86 +279,128 @@
             const cd = data.company_details || {};
             const ev = data.evaluation || {};
             const adv = data.advisory || {};
+            const href = safeUrl(cd.portal_url);
 
             document.getElementById('companyNameTag').innerText = cd.company_name || 'Target Company';
             document.getElementById('roleTitleHeader').innerText = cd.role_title || 'Matched role';
-            document.getElementById('companyPortalLink').href = cd.portal_url || '#';
-            document.getElementById('companyPortalLink').innerText = cd.portal_url || '#';
-            document.getElementById('applyDirectBtn').href = cd.portal_url || '#';
+            document.getElementById('companyPortalLink').href = href;
+            document.getElementById('companyPortalLink').innerText = cd.portal_url || 'No portal link';
+            document.getElementById('applyDirectBtn').href = href;
+            document.getElementById('expAlignmentText').innerText = ev.experience_note || 'Candidate and role details will appear here';
+            document.getElementById('scoreStory').innerText = ev.score_story || '';
+
+            const nextSkill = ev.best_next_skill;
+            document.getElementById('nextSkillCallout').innerText = nextSkill
+                ? `Highest leverage: learn ${nextSkill.skill} to add ${nextSkill.score_lift_pct} points.`
+                : 'Every listed skill on this role is already on the resume.';
 
             document.getElementById('resTierBadge').innerText = ev.match_tier || 'Evaluated';
             document.getElementById('valTotal').innerText = (ev.final_match_score_pct ?? '—') + (ev.final_match_score_pct == null ? '' : '%');
             document.getElementById('valSem').innerText = (ev.s_sem_pct ?? '—') + (ev.s_sem_pct == null ? '' : '%');
             document.getElementById('valSkill').innerText = (ev.s_skill_pct ?? '—') + (ev.s_skill_pct == null ? '' : '%');
             document.getElementById('valPhi').innerText = ev.phi_exp ?? '—';
+            if (data.job_id) document.getElementById('matchJobId').value = data.job_id;
 
             const matched = adv.matched_skills || [];
-            const matchedHtml = matched.map(s => `<span class="px-2.5 py-1 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-md font-bold">✓ ${s}</span>`).join('');
-            document.getElementById('skillPills').innerHTML = matchedHtml;
+            const missing = adv.missing_skills || [];
+            const matchedHtml = matched.map(skill => `<span class="px-2.5 py-1 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded-md font-bold">✓ ${escapeHtml(skill)}</span>`).join('');
+            const missingHtml = missing.map(skill => `<span class="px-2.5 py-1 bg-amber-500/10 text-amber-300 border border-amber-500/30 rounded-md font-bold">+ ${escapeHtml(skill)}</span>`).join('');
+            document.getElementById('skillPills').innerHTML = (matchedHtml + missingHtml) || '<span class="text-slate-500">This role has no listed skills from the taxonomy.</span>';
 
             if (adv.ats_bullet_points && adv.ats_bullet_points.length > 0) {
                 document.getElementById('atsBullet').innerText = `"${adv.ats_bullet_points[0]}"`;
             }
         }
 
+        document.getElementById('companyDirectoryList').addEventListener('click', (event) => {
+            if (event.target.closest('a')) return;
+            const card = event.target.closest('[data-match-index]');
+            if (!card) return;
+            renderEvaluationData(rankedMatches[Number(card.dataset.matchIndex)]);
+        });
+
         // 1. Resume Ingestion
         document.getElementById('resumeForm').addEventListener('submit', async (e) => {
             e.preventDefault();
-            const formData = new FormData();
-            formData.append('file', document.getElementById('resumeFile').files[0]);
-            formData.append('user_id', 1);
-            const res = await fetch(`${API_BASE_URL}/api/v1/parse-resume-pdf`, { method: 'POST', body: formData });
-            const data = await res.json();
+            const file = document.getElementById('resumeFile').files[0];
             const resDiv = document.getElementById('resumeResult');
             resDiv.classList.remove('hidden');
-            resDiv.innerHTML = `<div class="text-emerald-400 font-bold">✓ Parsed Resume ID #${data.resume_id} | Detected Tenure: ${data.detected_experience_years} Yrs</div>
-                <div class="flex flex-wrap gap-1 pt-1">${(data.detected_skills || []).map(s => `<span class="px-2 py-0.5 bg-slate-800 text-amber-300 rounded text-[10px] border border-slate-700 font-mono">${s}</span>`).join('')}</div>`;
-            document.getElementById('matchResumeId').value = data.resume_id;
-            document.getElementById('resumeStatusBadge').innerText = `Profile Loaded (${data.detected_experience_years} Yrs)`;
-            document.getElementById('resumeStatusBadge').className = 'text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold';
+            if (!file) {
+                resDiv.innerHTML = '<div class="text-amber-300">Choose a PDF resume first.</div>';
+                return;
+            }
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('user_id', 1);
+                const res = await fetch(`${API_BASE_URL}/api/v1/parse-resume-pdf`, { method: 'POST', body: formData });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Resume parsing failed.');
+                resDiv.innerHTML = `<div class="text-emerald-400 font-bold">Parsed resume #${escapeHtml(data.resume_id)} · ${escapeHtml(data.detected_experience_years)} years</div>
+                    <div class="flex flex-wrap gap-1 pt-1">${(data.detected_skills || []).map(skill => `<span class="px-2 py-0.5 bg-slate-800 text-amber-300 rounded text-[10px] border border-slate-700 font-mono">${escapeHtml(skill)}</span>`).join('') || '<span class="text-slate-500">No taxonomy skills detected.</span>'}</div>`;
+                document.getElementById('matchResumeId').value = data.resume_id;
+                document.getElementById('resumeStatusBadge').innerText = `Profile Loaded (${data.detected_experience_years} Yrs)`;
+                document.getElementById('resumeStatusBadge').className = 'text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-bold';
+            } catch (error) {
+                resDiv.innerHTML = `<div class="text-amber-300">${escapeHtml(error.message)}</div>`;
+            }
         });
+
+        async function rankStoredMarket(resumeId) {
+            const formData = new FormData();
+            formData.append('resume_id', resumeId);
+            const res = await fetch(`${API_BASE_URL}/api/v1/rank-market`, { method: 'POST', body: formData });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Ranking failed.');
+            rankedMatches = data.matches || [];
+            renderCompanyDirectory();
+            if (rankedMatches.length) renderEvaluationData(rankedMatches[0]);
+            renderMarketBrief(data.market_brief);
+            return data;
+        }
+
+        function renderMarketBrief(brief) {
+            const panel = document.getElementById('marketBrief');
+            if (!brief) {
+                panel.classList.add('hidden');
+                return;
+            }
+            panel.classList.remove('hidden');
+            const top = (brief.levers || [])[0];
+            document.getElementById('marketBriefSummary').innerText = top
+                ? `${brief.apply_now} roles are ready to apply. ${brief.one_skill_away} more reach that bar after one skill. Learning ${top.skill} improves ${top.roles_improved} openings and moves ${top.roles_promoted} up a tier.`
+                : `${brief.apply_now} roles are ready to apply. ${brief.one_skill_away} are one skill away.`;
+            document.getElementById('marketBriefLevers').innerHTML = (brief.levers || []).map((lever) =>
+                `<span class="px-2.5 py-1 rounded-md border border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-200 font-bold">${escapeHtml(lever.skill)} · ${escapeHtml(lever.roles_improved)} roles · ${escapeHtml(lever.roles_promoted)} tier moves</span>`
+            ).join('');
+        }
 
         // 2. Autonomous Market Discovery Scan
         document.getElementById('discoverMarketBtn').addEventListener('click', async () => {
             const discoverButton = document.getElementById('discoverMarketBtn');
-            discoverButton.disabled = true;
-            discoverButton.innerText = '⏳ Discovering openings...';
-            const resumeId = document.getElementById('matchResumeId').value || 1;
-            const formData = new FormData();
-            formData.append('resume_id', resumeId);
-            formData.append('country', document.getElementById('marketCountry').value || 'India');
-            
-            const res = await fetch(`${API_BASE_URL}/api/v1/market/discover`, { method: 'POST', body: formData });
-            const data = await res.json();
-            
-            evaluatedCompanies = data.jobs.map(j => ({
-                company_name: j.company,
-                role_title: j.title,
-                portal_url: j.portal_url,
-                location: j.location,
-                is_startup: j.is_startup,
-                relevance_score: j.relevance_score,
-                source: j.source,
-                source_url: j.source_url,
-                tier: "Discovered"
-            }));
-            
-            renderCompanyDirectory();
-            discoverButton.disabled = false;
-            discoverButton.innerText = '🔍 Discover All Nationwide Openings';
-            
             const crawlDiv = document.getElementById('crawlResult');
-            crawlDiv.classList.remove('hidden');
-            /*
-            crawlDiv.innerHTML = `<strong>✓ Market Scan Complete:</strong> Discovered ${data.total_discovered} openings across ${data.country || 'the selected country'}, including startups and established companies.${data.source_errors?.length ? ` Some sources failed: ${data.source_errors.length}.` : ''}`;
-            crawlDiv.innerHTML = `<strong>✓ Market Scan Complete:</strong> Discovered ${data.total_discovered} active corporate career portals hiring for Cloud & DevOps!`;
-        });
-
-            crawlDiv.innerHTML = `<strong>✓ Market Scan Complete:</strong> Discovered ${data.total_discovered} openings across ${data.country || 'the selected country'}, including startups and established companies.${data.source_errors?.length ? ` Some sources failed: ${data.source_errors.length}.` : ''}`;
-        });
-
-            */
-            crawlDiv.innerHTML = `<strong>${data.cache_hit ? 'Cached results returned' : 'Market scan complete'}:</strong> Discovered ${data.total_discovered} openings across ${data.country || 'the selected country'}, including startups and established companies.${data.source_errors?.length ? ` Some sources failed: ${data.source_errors.length}.` : ''}`;
+            discoverButton.disabled = true;
+            discoverButton.innerText = 'Discovering openings...';
+            const resumeId = document.getElementById('matchResumeId').value || 1;
+            try {
+                const formData = new FormData();
+                formData.append('resume_id', resumeId);
+                formData.append('country', document.getElementById('marketCountry').value || 'India');
+                const res = await fetch(`${API_BASE_URL}/api/v1/market/discover`, { method: 'POST', body: formData });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Market discovery failed.');
+                discoverButton.innerText = 'Scoring every opening...';
+                const ranking = await rankStoredMarket(resumeId);
+                const modeLabel = ranking.semantic_mode === 'neural' ? 'embedding model' : 'offline word overlap';
+                crawlDiv.classList.remove('hidden');
+                crawlDiv.innerHTML = `<strong>${data.cache_hit ? 'Cached results returned' : 'Market scan complete'}:</strong> Discovered ${escapeHtml(data.total_discovered)} openings and ranked ${escapeHtml(ranking.total_ranked)} stored roles with the ${modeLabel}.${data.source_errors?.length ? ` Some sources failed: ${escapeHtml(data.source_errors.length)}.` : ''}`;
+            } catch (error) {
+                crawlDiv.classList.remove('hidden');
+                crawlDiv.innerHTML = `<strong>Scan stopped:</strong> ${escapeHtml(error.message)}`;
+            } finally {
+                discoverButton.disabled = false;
+                discoverButton.innerText = 'Discover All Nationwide Openings';
+            }
         });
 
         // 3. Match Evaluation
@@ -376,6 +411,11 @@
             formData.append('job_id', document.getElementById('matchJobId').value);
             const res = await fetch(`${API_BASE_URL}/api/v1/evaluate-matches`, { method: 'POST', body: formData });
             const data = await res.json();
+            if (!res.ok) {
+                document.getElementById('scoreStory').innerText = data.detail || 'Evaluation failed.';
+                return;
+            }
+            data.job_id = document.getElementById('matchJobId').value;
             renderEvaluationData(data);
         });
 

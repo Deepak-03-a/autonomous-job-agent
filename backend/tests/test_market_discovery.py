@@ -44,6 +44,12 @@ def test_unknown_resume_does_not_get_devops_fallback_skills():
     assert extract_skills_from_text("Marketing manager with campaign strategy experience") == []
 
 
+def test_go_to_phrase_is_not_the_go_language():
+    assert "go" not in extract_skills_from_text("Docsumo is your go-to Document AI solution")
+    assert "go" in extract_skills_from_text("Backend services written in Go and PostgreSQL")
+    assert "golang" in extract_skills_from_text("Senior Software Engineer (Golang)")
+
+
 def test_repeated_discovery_uses_cache():
     agent = FakeMarketDiscoveryAgent(
         sources=[{"name": "Test feed", "url": "https://jobs.example.test/feed"}]

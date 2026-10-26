@@ -29,7 +29,7 @@ def extract_skills_from_text(text: str) -> list[str]:
     text_lower = text.lower()
     return [
         skill for skill in SKILL_TAXONOMY_WEIGHTS
-        if re.search(r"(?<!\w)" + re.escape(skill) + r"(?!\w)", text_lower)
+        if re.search(r"(?<![\w-])" + re.escape(skill) + r"(?![\w-])", text_lower)
     ]
 
 class ResumeParserAgent:

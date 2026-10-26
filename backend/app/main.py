@@ -1,14 +1,14 @@
 import os
 import json
+import threading
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
 
 from app.database import init_db, get_db
 from app.agents.parser import ResumeParserAgent, SKILL_TAXONOMY_WEIGHTS, extract_skills_from_text
 from app.agents.crawler import EthicalCrawlerAgent, MarketDiscoveryAgent
-from app.agents.matcher import HybridJobMatcherAgent
+from app.agents.matcher import HybridJobMatcherAgent, build_market_brief
 from app.agents.advisor import SkillGapAdvisorAgent
 
 app = FastAPI(
@@ -28,6 +28,9 @@ app.add_middleware(
 @app.on_event("startup")
 def startup_event():
     init_db()
+    # The embedding model is optional. Warm it in the background so the API
+    # answers immediately and falls back to word overlap if the download fails.
+    threading.Thread(target=matcher_agent.warm_embedder, daemon=True).start()
 
 parser_agent = ResumeParserAgent()
 crawler_agent = EthicalCrawlerAgent()
@@ -204,13 +207,18 @@ def evaluate_matches(resume_id: int = Form(1), job_id: int = Form(1)):
         cand_years=resume["exp_years"],
         req_years=job["req_years"]
     )
-    advice = advisor_agent.generate_advice(resume_skills, job_weights)
+    advice = advisor_agent.generate_advice(
+        resume_skills,
+        job_weights,
+        job_title=job["title"] or "",
+        score_lifts=eval_res["skill_lifts"],
+    )
     
     cursor.execute(
         """INSERT INTO match_results 
            (candidate_name, job_title, company, s_sem_pct, s_skill_pct, phi_exp, s_total_pct, match_tier, missing_json, created_at) 
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-        ("Ram Deepak Kasavajhala", job["title"], job["company"], eval_res["s_sem_pct"], eval_res["s_skill_pct"], eval_res["phi_exp"], eval_res["final_match_score_pct"], eval_res["match_tier"], json.dumps(advice["missing_skills"]))
+        ("Candidate", job["title"], job["company"], eval_res["s_sem_pct"], eval_res["s_skill_pct"], eval_res["phi_exp"], eval_res["final_match_score_pct"], eval_res["match_tier"], json.dumps(advice["missing_skills"]))
     )
     db.commit()
     db.close()
@@ -231,3 +239,93 @@ def evaluate_matches(resume_id: int = Form(1), job_id: int = Form(1)):
         "evaluation": eval_res,
         "advisory": advice
     }
+
+
+def _job_payload(row) -> dict:
+    try:
+        weights = json.loads(row["weights_json"] or "{}")
+    except json.JSONDecodeError:
+        weights = {}
+    if not isinstance(weights, dict):
+        weights = {}
+    return {
+        "id": row["id"],
+        "title": row["title"] or "",
+        "company": row["company"] or "",
+        "url": row["url"] or "",
+        "description": row["description"] or "",
+        "req_years": row["req_years"] or 0.0,
+        "weights": weights,
+        "location": row["location"] or "",
+        "country": row["country"] or "",
+        "source": row["source"] or "",
+        "is_startup": bool(row["is_startup"]),
+        "posted_at": row["posted_at"] or "",
+    }
+
+
+@app.post("/api/v1/rank-market")
+def rank_market(resume_id: int = Form(1)):
+    """Score every stored opening and attach the skill that would move each match."""
+    db = get_db()
+    try:
+        cursor = db.cursor()
+        resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
+        if not resume:
+            resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
+        if not resume:
+            raise HTTPException(status_code=404, detail="Upload a resume before ranking the market.")
+
+        rows = cursor.execute("SELECT * FROM jobs ORDER BY id ASC").fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Discover openings before ranking them.")
+
+        resume_skills = json.loads(resume["skills_json"] or "[]")
+        jobs = [_job_payload(row) for row in rows]
+        ranked, semantic_mode = matcher_agent.rank_jobs(
+            resume["raw_text"] or "",
+            resume_skills,
+            resume["exp_years"] or 0.0,
+            jobs,
+        )
+
+        matches = []
+        for item in ranked:
+            job = item["job"]
+            evaluation = item["evaluation"]
+            advice = advisor_agent.generate_advice(
+                resume_skills,
+                job["weights"],
+                job_title=job["title"],
+                score_lifts=evaluation["skill_lifts"],
+            )
+            matches.append({
+                "job_id": job["id"],
+                "company_details": {
+                    "company_name": job["company"],
+                    "role_title": job["title"],
+                    "portal_url": job["url"],
+                    "required_experience_years": job["req_years"],
+                    "location": job["location"],
+                    "source": job["source"],
+                    "is_startup": job["is_startup"],
+                },
+                "candidate_profile": {
+                    "detected_experience_years": resume["exp_years"],
+                    "matched_skills": advice["matched_skills"],
+                    "missing_skills": advice["missing_skills"],
+                },
+                "evaluation": evaluation,
+                "advisory": advice,
+            })
+
+        return {
+            "status": "success",
+            "resume_id": resume["id"],
+            "semantic_mode": semantic_mode,
+            "total_ranked": len(matches),
+            "market_brief": build_market_brief(ranked),
+            "matches": matches,
+        }
+    finally:
+        db.close()
