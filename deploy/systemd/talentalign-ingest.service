@@ -1,0 +1,11 @@
+[Unit]
+Description=TalentAlign ingestion worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=talentalign
+WorkingDirectory=/opt/talentalign/backend
+EnvironmentFile=/etc/talentalign/talentalign.env
+ExecStart=/opt/talentalign/.venv/bin/python -m apps.worker.ingest

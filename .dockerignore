@@ -1,0 +1,9 @@
+.git/
+.venv/
+venv/
+backend/venv/
+backend/.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+*.py[cod]
+*.db

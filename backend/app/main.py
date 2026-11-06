@@ -1,15 +1,20 @@
 import os
 import json
 import threading
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 from app.database import init_db, get_db
 from app.agents.parser import ResumeParserAgent, SKILL_TAXONOMY_WEIGHTS, extract_skills_from_text
 from app.agents.crawler import EthicalCrawlerAgent, MarketDiscoveryAgent
 from app.agents.matcher import HybridJobMatcherAgent, build_market_brief
 from app.agents.advisor import SkillGapAdvisorAgent
+from core.config import settings
+from adapters.db.app_store import PostgresApplicationStore
+from adapters.llm.embeddings import MiniLMEmbedder
 
 app = FastAPI(
     title="Autonomous Multi-Agent Job Alignment & Career Portal",
@@ -25,9 +30,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+APP_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_ROOT.parent
+if not (PROJECT_ROOT / "frontend").exists():
+    PROJECT_ROOT = APP_ROOT.parents[1]
+FRONTEND_ROOT = PROJECT_ROOT / "frontend"
+STATIC_ROOT = APP_ROOT / "static"
+POSTGRES_STORE = (
+    PostgresApplicationStore(settings.database_url)
+    if settings.database_url.startswith("postgresql")
+    else None
+)
+RESUME_EMBEDDER = MiniLMEmbedder(settings.embedding_model, settings.embedding_dimensions) if POSTGRES_STORE else None
+POSTGRES_MIGRATION = APP_ROOT.parent / "adapters" / "db" / "migrations" / "001_initial.sql"
+if not POSTGRES_MIGRATION.exists():
+    POSTGRES_MIGRATION = PROJECT_ROOT / "backend" / "adapters" / "db" / "migrations" / "001_initial.sql"
+
+if STATIC_ROOT.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
+if FRONTEND_ROOT.exists():
+    app.mount("/frontend", StaticFiles(directory=FRONTEND_ROOT), name="frontend")
+
+
+@app.middleware("http")
+async def optional_api_token(request: Request, call_next):
+    """Require a bearer token only when Linux deployment configures one."""
+    if settings.api_token and request.url.path.startswith("/api/"):
+        if request.headers.get("authorization") != f"Bearer {settings.api_token}":
+            return JSONResponse({"detail": "A valid bearer token is required."}, status_code=401)
+    return await call_next(request)
+
 @app.on_event("startup")
 def startup_event():
-    init_db()
+    if POSTGRES_STORE is not None:
+        POSTGRES_STORE.migrate(POSTGRES_MIGRATION)
+    else:
+        init_db()
     # The embedding model is optional. Warm it in the background so the API
     # answers immediately and falls back to word overlap if the download fails.
     threading.Thread(target=matcher_agent.warm_embedder, daemon=True).start()
@@ -40,6 +78,10 @@ advisor_agent = SkillGapAdvisorAgent()
 
 @app.get("/", response_class=HTMLResponse)
 def read_dashboard():
+    react_index_path = FRONTEND_ROOT / "index.html"
+    if react_index_path.exists():
+        return react_index_path.read_text(encoding="utf-8")
+
     template_path = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
     if os.path.exists(template_path):
         with open(template_path, "r", encoding="utf-8") as f:
@@ -62,15 +104,18 @@ async def parse_resume_pdf(file: UploadFile = File(...), user_id: int = Form(1))
     pdf_bytes = await file.read()
     parsed_data = parser_agent.parse_pdf_bytes(pdf_bytes)
     
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute(
-        "INSERT INTO resumes (user_id, filename, raw_text, exp_years, skills_json) VALUES (?, ?, ?, ?, ?)",
-        (user_id, file.filename, parsed_data["raw_text"], parsed_data["exp_years"], json.dumps(parsed_data["skills"]))
-    )
-    db.commit()
-    resume_id = cursor.lastrowid
-    db.close()
+    if POSTGRES_STORE is not None:
+        resume_id = POSTGRES_STORE.insert_resume(file.filename, parsed_data, user_id)
+    else:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO resumes (user_id, filename, raw_text, exp_years, skills_json) VALUES (?, ?, ?, ?, ?)",
+            (user_id, file.filename, parsed_data["raw_text"], parsed_data["exp_years"], json.dumps(parsed_data["skills"]))
+        )
+        db.commit()
+        resume_id = cursor.lastrowid
+        db.close()
 
     return {
         "status": "success",
@@ -87,14 +132,36 @@ def discover_live_market(
     country: str = Form("India"),
     max_pages: int | None = Form(None),
 ):
-    db = get_db()
-    cursor = db.cursor()
-    resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
-    if not resume:
-        resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
+    if POSTGRES_STORE is not None:
+        resume = POSTGRES_STORE.get_resume(resume_id) or POSTGRES_STORE.latest_resume()
+        if not resume:
+            market_jobs = []
+        else:
+            query_embedding = RESUME_EMBEDDER.encode([resume["raw_text"]])[0]
+            market_jobs = POSTGRES_STORE.search_jobs_by_embedding(query_embedding, country, limit=100)
+        return {
+            "status": "success",
+            "country": country,
+            "cache_hit": False,
+            "total_discovered": len(market_jobs),
+            "result_limit": None,
+            "source_errors": [],
+            "jobs": market_jobs,
+        }
+    else:
+        db = get_db()
+        cursor = db.cursor()
+        resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
+        if not resume:
+            resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
     
     cand_years = resume["exp_years"] if resume else 0.0
-    resume_skills = json.loads(resume["skills_json"]) if resume else []
+    stored_skills = resume.get("skills") if POSTGRES_STORE is not None and resume else None
+    resume_skills = (
+        stored_skills if isinstance(stored_skills, list)
+        else json.loads(resume["skills_json"])
+        if resume else []
+    )
     resume_text = resume["raw_text"] if resume else ""
     
     market_jobs = market_agent.discover_market_jobs(
@@ -105,22 +172,25 @@ def discover_live_market(
         max_pages=max_pages,
     )
     
-    # Automatically ingest all market jobs into SQLite database
-    for job in market_jobs:
-        cursor.execute(
-            """INSERT OR REPLACE INTO jobs
-               (job_code, title, company, url, description, req_years, weights_json,
-                location, country, source, posted_at, is_startup)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                job["job_code"], job["title"], job["company"], job["portal_url"],
-                job["description"], job["req_years"], json.dumps(job["weights"]),
-                job["location"], job["country"] or country, job["source"],
-                job["posted_at"], int(job["is_startup"]),
+    if POSTGRES_STORE is not None:
+        POSTGRES_STORE.upsert_jobs(market_jobs, country)
+    else:
+        # Automatically ingest all market jobs into SQLite database.
+        for job in market_jobs:
+            cursor.execute(
+                """INSERT OR REPLACE INTO jobs
+                   (job_code, title, company, url, description, req_years, weights_json,
+                    location, country, source, posted_at, is_startup)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job["job_code"], job["title"], job["company"], job["portal_url"],
+                    job["description"], job["req_years"], json.dumps(job["weights"]),
+                    job["location"], job["country"] or country, job["source"],
+                    job["posted_at"], int(job["is_startup"]),
+                )
             )
-        )
-    db.commit()
-    db.close()
+        db.commit()
+        db.close()
     
     return {
         "status": "success",
@@ -152,21 +222,42 @@ async def crawl_job_portal(
     if not default_weights:
         default_weights = {"general": 1.0}
     
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute(
-        """INSERT OR REPLACE INTO jobs
-           (job_code, title, company, url, description, req_years, weights_json,
-            location, country, source, posted_at, is_startup)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            job_code, title, company, url, crawl_res["clean_text"], req_years,
-            json.dumps(default_weights), "Location not specified", "", "Manual crawl", "", 0,
+    if POSTGRES_STORE is not None:
+        postgres_ids = POSTGRES_STORE.upsert_jobs(
+            [{
+                "job_code": job_code,
+                "title": title,
+                "company": company,
+                "portal_url": url,
+                "description": crawl_res["clean_text"],
+                "req_years": req_years,
+                "weights": default_weights,
+                "location": "Location not specified",
+                "source": "manual",
+                "careers_url": url,
+                "company_website": url,
+                "application_url": url,
+                "provider": "direct",
+            }],
+            "",
         )
-    )
-    db.commit()
-    job_id = cursor.lastrowid
-    db.close()
+        job_id = postgres_ids[0] if postgres_ids else None
+    else:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute(
+            """INSERT OR REPLACE INTO jobs
+               (job_code, title, company, url, description, req_years, weights_json,
+                location, country, source, posted_at, is_startup)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                job_code, title, company, url, crawl_res["clean_text"], req_years,
+                json.dumps(default_weights), "Location not specified", "", "Manual crawl", "", 0,
+            )
+        )
+        db.commit()
+        job_id = cursor.lastrowid
+        db.close()
     
     return {
         "status": "success",
@@ -183,21 +274,26 @@ async def crawl_job_portal(
 
 @app.post("/api/v1/evaluate-matches")
 def evaluate_matches(resume_id: int = Form(1), job_id: int = Form(1)):
-    db = get_db()
-    cursor = db.cursor()
-    resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
-    job = cursor.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-    
-    if not resume:
-        resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
-    if not job:
-        job = cursor.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
+    if POSTGRES_STORE is not None:
+        resume = POSTGRES_STORE.get_resume(resume_id) or POSTGRES_STORE.latest_resume()
+        job = POSTGRES_STORE.get_job(job_id) or POSTGRES_STORE.latest_job()
+        cursor = db = None
+    else:
+        db = get_db()
+        cursor = db.cursor()
+        resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
+        job = cursor.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not resume:
+            resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
+        if not job:
+            job = cursor.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
     if not resume or not job:
-        db.close()
+        if db is not None:
+            db.close()
         raise HTTPException(status_code=404, detail="Resume or Job record not found in SQLite database.")
         
-    resume_skills = json.loads(resume["skills_json"])
-    job_weights = json.loads(job["weights_json"])
+    resume_skills = resume["skills"] if POSTGRES_STORE is not None else json.loads(resume["skills_json"])
+    job_weights = job["weights"] if POSTGRES_STORE is not None else json.loads(job["weights_json"])
     
     eval_res = matcher_agent.evaluate_job_match(
         resume_text=resume["raw_text"],
@@ -214,14 +310,17 @@ def evaluate_matches(resume_id: int = Form(1), job_id: int = Form(1)):
         score_lifts=eval_res["skill_lifts"],
     )
     
-    cursor.execute(
-        """INSERT INTO match_results 
-           (candidate_name, job_title, company, s_sem_pct, s_skill_pct, phi_exp, s_total_pct, match_tier, missing_json, created_at) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-        ("Candidate", job["title"], job["company"], eval_res["s_sem_pct"], eval_res["s_skill_pct"], eval_res["phi_exp"], eval_res["final_match_score_pct"], eval_res["match_tier"], json.dumps(advice["missing_skills"]))
-    )
-    db.commit()
-    db.close()
+    if POSTGRES_STORE is not None:
+        POSTGRES_STORE.insert_match(resume["id"], job, eval_res)
+    else:
+        cursor.execute(
+            """INSERT INTO match_results
+               (candidate_name, job_title, company, s_sem_pct, s_skill_pct, phi_exp, s_total_pct, match_tier, missing_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            ("Candidate", job["title"], job["company"], eval_res["s_sem_pct"], eval_res["s_skill_pct"], eval_res["phi_exp"], eval_res["final_match_score_pct"], eval_res["match_tier"], json.dumps(advice["missing_skills"]))
+        )
+        db.commit()
+        db.close()
     
     return {
         "status": "success",
@@ -267,20 +366,31 @@ def _job_payload(row) -> dict:
 @app.post("/api/v1/rank-market")
 def rank_market(resume_id: int = Form(1)):
     """Score every stored opening and attach the skill that would move each match."""
-    db = get_db()
+    db = None
     try:
-        cursor = db.cursor()
-        resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
-        if not resume:
-            resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
+        if POSTGRES_STORE is not None:
+            resume = POSTGRES_STORE.get_resume(resume_id) or POSTGRES_STORE.latest_resume()
+            rows = (
+                POSTGRES_STORE.search_jobs_by_embedding(
+                    RESUME_EMBEDDER.encode([resume["raw_text"]])[0],
+                    limit=100,
+                )
+                if resume else []
+            )
+        else:
+            db = get_db()
+            cursor = db.cursor()
+            resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
+            if not resume:
+                resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
+            rows = cursor.execute("SELECT * FROM jobs ORDER BY id ASC").fetchall()
         if not resume:
             raise HTTPException(status_code=404, detail="Upload a resume before ranking the market.")
 
-        rows = cursor.execute("SELECT * FROM jobs ORDER BY id ASC").fetchall()
         if not rows:
             raise HTTPException(status_code=404, detail="Discover openings before ranking them.")
 
-        resume_skills = json.loads(resume["skills_json"] or "[]")
+        resume_skills = resume["skills"] if POSTGRES_STORE is not None else json.loads(resume["skills_json"] or "[]")
         jobs = [_job_payload(row) for row in rows]
         ranked, semantic_mode = matcher_agent.rank_jobs(
             resume["raw_text"] or "",
@@ -328,4 +438,5 @@ def rank_market(resume_id: int = Form(1)):
             "matches": matches,
         }
     finally:
-        db.close()
+        if db is not None:
+            db.close()

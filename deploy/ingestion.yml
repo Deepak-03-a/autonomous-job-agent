@@ -1,0 +1,8 @@
+version: 1
+sources:
+  - name: company-careers
+    min_interval_s: 15
+    max_runs_per_day: 4
+    attribution: Official company career page
+    check_robots: true
+

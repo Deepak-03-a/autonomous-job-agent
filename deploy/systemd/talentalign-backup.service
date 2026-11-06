@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly TalentAlign PostgreSQL backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=talentalign
+EnvironmentFile=/etc/talentalign/talentalign.env
+ExecStart=/bin/sh -c 'mkdir -p "$TALENTALIGN_BACKUP_DIR" && pg_dump "$DATABASE_URL" | gzip > "$TALENTALIGN_BACKUP_DIR/talentalign-$(date +%%F).sql.gz"'
