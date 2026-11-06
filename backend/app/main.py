@@ -1,5 +1,6 @@
 import os
 import json
+import secrets
 import threading
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -15,6 +16,7 @@ from app.agents.advisor import SkillGapAdvisorAgent
 from core.config import settings
 from adapters.db.app_store import PostgresApplicationStore
 from adapters.llm.embeddings import MiniLMEmbedder
+from adapters.llm.ollama import OllamaClient
 
 app = FastAPI(
     title="Autonomous Multi-Agent Job Alignment & Career Portal",
@@ -54,9 +56,15 @@ if FRONTEND_ROOT.exists():
 
 @app.middleware("http")
 async def optional_api_token(request: Request, call_next):
-    """Require a bearer token only when Linux deployment configures one."""
+    """Require a server-side bearer token or a valid hashed browser session."""
     if settings.api_token and request.url.path.startswith("/api/"):
-        if request.headers.get("authorization") != f"Bearer {settings.api_token}":
+        bearer = request.headers.get("authorization", "")
+        cookie = request.cookies.get("talentalign_session", "")
+        authorized = (
+            secrets.compare_digest(bearer, f"Bearer {settings.api_token}")
+            or (POSTGRES_STORE is not None and POSTGRES_STORE.is_valid_web_session(cookie))
+        )
+        if not authorized:
             return JSONResponse({"detail": "A valid bearer token is required."}, status_code=401)
     return await call_next(request)
 
@@ -75,18 +83,42 @@ crawler_agent = EthicalCrawlerAgent()
 market_agent = MarketDiscoveryAgent()
 matcher_agent = HybridJobMatcherAgent(alpha=0.60, decay_lambda=0.35)
 advisor_agent = SkillGapAdvisorAgent()
+ollama_client = OllamaClient(settings.ollama_url, settings.ollama_model, keep_alive=settings.ollama_keep_alive)
 
 @app.get("/", response_class=HTMLResponse)
-def read_dashboard():
+def read_dashboard(request: Request):
     react_index_path = FRONTEND_ROOT / "index.html"
     if react_index_path.exists():
-        return react_index_path.read_text(encoding="utf-8")
-
-    template_path = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
-    if os.path.exists(template_path):
-        with open(template_path, "r", encoding="utf-8") as f:
-            return f.read()
-    return "<h1>Dashboard template not found.</h1>"
+        page = react_index_path.read_text(encoding="utf-8")
+    else:
+        template_path = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
+        if os.path.exists(template_path):
+            with open(template_path, "r", encoding="utf-8") as f:
+                page = f.read()
+        else:
+            page = "<h1>Dashboard template not found.</h1>"
+    response = HTMLResponse(page)
+    if settings.api_token:
+        # Give the browser a per-session opaque token. PostgreSQL stores only
+        # its hash; JavaScript cannot read the HttpOnly cookie.
+        forwarded_proto = request.headers.get("x-forwarded-proto", "")
+        session = request.cookies.get("talentalign_session", "")
+        if POSTGRES_STORE is not None and not POSTGRES_STORE.is_valid_web_session(session):
+            session = POSTGRES_STORE.issue_web_session()
+        elif POSTGRES_STORE is None:
+            # SQLite development mode retains compatibility with the configured
+            # bearer token; production PostgreSQL deployments use DB sessions.
+            session = settings.api_token
+        response.set_cookie(
+            "talentalign_session",
+            session,
+            httponly=True,
+            secure=request.url.scheme == "https" or forwarded_proto == "https",
+            samesite="strict",
+            path="/api/",
+            max_age=60 * 60 * 24 * 30,
+        )
+    return response
 
 @app.get("/health")
 def health_check():
@@ -96,6 +128,71 @@ def health_check():
         "system": "Autonomous Multi-Agent Career & Job Discovery Engine",
         "candidate": "Ram Deepak Kasavajhala"
     }
+
+
+@app.post("/api/v1/chat")
+def chat_about_match(payload: dict):
+    """Explain a selected job match using stored data and Ollama when available."""
+    question = str(payload.get("question", "")).strip()
+    if not question or len(question) > 1000:
+        raise HTTPException(status_code=400, detail="Question must contain 1 to 1000 characters.")
+    try:
+        job_id = int(payload.get("job_id"))
+        resume_id = int(payload.get("resume_id", 1))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="A valid job_id and resume_id are required.")
+
+    db = None
+    try:
+        if POSTGRES_STORE is not None:
+            job = POSTGRES_STORE.get_chat_job(job_id)
+            resume = POSTGRES_STORE.get_resume(resume_id)
+        else:
+            db = get_db()
+            cursor = db.cursor()
+            job_row = cursor.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            resume_row = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
+            job = dict(job_row) if job_row else None
+            resume = dict(resume_row) if resume_row else None
+            if job:
+                job["weights"] = json.loads(job.get("weights_json") or "{}")
+            if resume:
+                resume["skills"] = json.loads(resume.get("skills_json") or "[]")
+        if not job or not resume:
+            raise HTTPException(status_code=404, detail="Select a saved job and uploaded resume first.")
+
+        skills = resume.get("skills") or []
+        weights = job.get("weights") or {}
+        context = {
+            "job_title": job.get("title") or "",
+            "company": job.get("company") or job.get("company_id") or "",
+            "location": job.get("location") or "",
+            "job_description": (job.get("description") or "")[:5000],
+            "required_experience_years": job.get("req_years") or 0,
+            "job_skills": list(weights.keys()) if isinstance(weights, dict) else [],
+            "candidate_skills": skills,
+            "candidate_experience_years": resume.get("exp_years") or 0,
+        }
+        fallback = (
+            f"{context['job_title']} at {context['company']} is listed in "
+            f"{context['location'] or 'an unspecified location'}. Your resume lists "
+            f"{', '.join(skills[:8]) if skills else 'no extracted skills'}. "
+            "I could not reach the local Ollama model, so this is a data-only summary."
+        )
+        try:
+            result = ollama_client.explain(question, context)
+            evidence = result["evidence"]
+            context_text = json.dumps(context, ensure_ascii=False)
+            # Only display generated text when every claimed evidence snippet
+            # is present in the stored context.
+            if not evidence or any(not isinstance(item, str) or item not in context_text for item in evidence):
+                raise ValueError("Explanation evidence did not match stored data")
+            return {"answer": result["answer"], "source": "ollama", "evidence": evidence}
+        except Exception:
+            return {"answer": fallback, "source": "fallback", "evidence": []}
+    finally:
+        if db is not None:
+            db.close()
 
 @app.post("/api/v1/parse-resume-pdf")
 async def parse_resume_pdf(file: UploadFile = File(...), user_id: int = Form(1)):
@@ -388,7 +485,14 @@ def rank_market(resume_id: int = Form(1)):
             raise HTTPException(status_code=404, detail="Upload a resume before ranking the market.")
 
         if not rows:
-            raise HTTPException(status_code=404, detail="Discover openings before ranking them.")
+            return {
+                "status": "success",
+                "resume_id": resume["id"],
+                "semantic_mode": "no_jobs",
+                "total_ranked": 0,
+                "market_brief": {},
+                "matches": [],
+            }
 
         resume_skills = resume["skills"] if POSTGRES_STORE is not None else json.loads(resume["skills_json"] or "[]")
         jobs = [_job_payload(row) for row in rows]

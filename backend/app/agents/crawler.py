@@ -375,7 +375,10 @@ class MarketDiscoveryAgent:
             jobs,
             key=lambda job: (-job["relevance_score"], job["company"].lower(), job["title"].lower()),
         )
-        self._write_cache(cache_key, sorted_jobs)
+        # Empty responses are often transient (for example, a source may be
+        # briefly sparse). Do not cache them and hide later matching jobs.
+        if sorted_jobs:
+            self._write_cache(cache_key, sorted_jobs)
         return sorted_jobs
 
     @classmethod

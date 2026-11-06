@@ -35,8 +35,12 @@ CREATE TABLE IF NOT EXISTS jobs (
     content_hash TEXT,
     embedding vector(384),
     enriched_version INTEGER NOT NULL DEFAULT 0,
+    enrichment_claimed_at TIMESTAMPTZ,
     UNIQUE(source, external_id)
 );
+
+-- Keep upgrades safe for databases created from an earlier version of this file.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS enrichment_claimed_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS job_requirements (
     job_id BIGINT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -63,6 +67,14 @@ CREATE TABLE IF NOT EXISTS feedback (
     action TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS web_sessions (
+    token_hash TEXT PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS web_sessions_expires_at_idx ON web_sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS ingestion_runs (
     id BIGSERIAL PRIMARY KEY,
