@@ -1,6 +1,8 @@
 """Application-facing PostgreSQL store used when DATABASE_URL is PostgreSQL."""
 
 import json
+import hashlib
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,11 @@ class PostgresApplicationStore:
 
     def migrate(self, migration_path: str | Path) -> None:
         sql = Path(migration_path).read_text(encoding="utf-8")
-        with self._connect() as connection:
+        # The migration creates the pgvector extension. Registering the vector
+        # type before that first migration runs fails on a fresh database.
+        import psycopg
+
+        with psycopg.connect(self.database_url) as connection:
             for statement in sql.split(";\n"):
                 statement = statement.strip()
                 if statement:
@@ -124,6 +130,46 @@ class PostgresApplicationStore:
                 (job_id,),
             ).fetchone()
             return self._format_job(row)
+
+    def get_chat_job(self, job_id: int) -> dict[str, Any] | None:
+        """Return the job fields needed to ground an assistant response."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT id, title, company_id AS company, description, location,
+                          req_years, weights, status, application_url
+                   FROM jobs WHERE id = %s""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {**row, "weights": row.get("weights") or {}}
+
+    def issue_web_session(self, lifetime_days: int = 30) -> str:
+        """Create an opaque browser session; only its SHA-256 digest is stored."""
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with self._connect() as connection:
+            connection.execute("DELETE FROM web_sessions WHERE expires_at <= now()")
+            connection.execute(
+                """INSERT INTO web_sessions(token_hash, expires_at)
+                   VALUES (%s, now() + (%s * interval '1 day'))""",
+                (digest, lifetime_days),
+            )
+        return token
+
+    def is_valid_web_session(self, token: str) -> bool:
+        if not token or len(token) > 200:
+            return False
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT EXISTS(
+                       SELECT 1 FROM web_sessions
+                       WHERE token_hash = %s AND expires_at > now()
+                   ) AS valid""",
+                (digest,),
+            ).fetchone()
+            return bool(row["valid"])
 
     def latest_job(self) -> dict[str, Any] | None:
         with self._connect() as connection:

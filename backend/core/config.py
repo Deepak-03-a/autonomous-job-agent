@@ -10,6 +10,7 @@ class Settings:
     api_token: str = os.getenv("TALENTALIGN_API_TOKEN", "")
     ollama_url: str = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+    ollama_keep_alive: str = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     embedding_dimensions: int = int(os.getenv("EMBEDDING_DIMENSIONS", "384"))
     queue_poll_seconds: int = int(os.getenv("QUEUE_POLL_SECONDS", "5"))

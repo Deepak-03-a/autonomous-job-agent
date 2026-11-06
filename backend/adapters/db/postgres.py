@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+import json
 
 from core.domain import JobPosting
 
@@ -30,7 +31,10 @@ class PostgresStore:
 
     def migrate(self, migration_path: str | Path) -> None:
         migration_sql = Path(migration_path).read_text(encoding="utf-8")
-        with self.connection() as connection:
+        # Run CREATE EXTENSION before registering pgvector's database type.
+        import psycopg
+
+        with psycopg.connect(self.database_url) as connection:
             for statement in migration_sql.split(";\n"):
                 statement = statement.strip()
                 if statement:
@@ -41,15 +45,24 @@ class PostgresStore:
             connection.execute(
                 """
                 INSERT INTO jobs
-                    (source, external_id, company_id, title, location, work_mode,
-                     description, posted_at, first_seen, last_seen, status,
+                    (source, external_id, company_id, title, location, country, work_mode,
+                     description, req_years, weights, careers_url, application_url, provider,
+                     is_startup, posted_at, first_seen, last_seen, status,
                      content_hash, embedding, enriched_version)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), now(), %s, %s, %s, 0)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
+                        %s, %s, now(), now(), %s, %s, %s, 0)
                 ON CONFLICT (source, external_id) DO UPDATE SET
                     title = EXCLUDED.title,
                     location = EXCLUDED.location,
+                    country = EXCLUDED.country,
                     work_mode = EXCLUDED.work_mode,
                     description = EXCLUDED.description,
+                    req_years = EXCLUDED.req_years,
+                    weights = EXCLUDED.weights,
+                    careers_url = EXCLUDED.careers_url,
+                    application_url = EXCLUDED.application_url,
+                    provider = EXCLUDED.provider,
+                    is_startup = EXCLUDED.is_startup,
                     posted_at = EXCLUDED.posted_at,
                     last_seen = now(),
                     status = EXCLUDED.status,
@@ -66,8 +79,15 @@ class PostgresStore:
                     job.metadata.get("company_id"),
                     job.title,
                     job.location,
+                    job.metadata.get("country"),
                     job.work_mode,
                     job.description,
+                    job.metadata.get("req_years", 0),
+                    json.dumps(job.metadata.get("weights", job.requirements)),
+                    job.metadata.get("careers_url", ""),
+                    job.metadata.get("application_url", ""),
+                    job.metadata.get("provider", job.source),
+                    bool(job.metadata.get("is_startup", False)),
                     job.posted_at,
                     job.status,
                     job.content_hash,
@@ -79,12 +99,21 @@ class PostgresStore:
         with self.connection() as connection:
             rows = connection.execute(
                 """
-                SELECT id, source, external_id, title, description
-                FROM jobs
-                WHERE status = 'open' AND enriched_version < 1
-                ORDER BY last_seen
-                FOR UPDATE SKIP LOCKED
-                LIMIT %s
+                WITH candidates AS (
+                    SELECT id
+                    FROM jobs
+                    WHERE status = 'open' AND enriched_version < 1
+                      AND (enrichment_claimed_at IS NULL
+                           OR enrichment_claimed_at < now() - interval '15 minutes')
+                    ORDER BY last_seen
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE jobs AS j
+                SET enrichment_claimed_at = now()
+                FROM candidates
+                WHERE j.id = candidates.id
+                RETURNING j.id, j.source, j.external_id, j.title, j.description
                 """,
                 (limit,),
             ).fetchall()
@@ -134,5 +163,17 @@ class PostgresStore:
                 )
             connection.execute(
                 "UPDATE jobs SET enriched_version = enriched_version + 1 WHERE id = %s",
+                (job_id,),
+            )
+            connection.execute(
+                "UPDATE jobs SET enrichment_claimed_at = NULL WHERE id = %s",
+                (job_id,),
+            )
+
+    def release_enrichment_job(self, job_id: int) -> None:
+        """Release a failed job immediately; stale leases also expire in 15m."""
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE jobs SET enrichment_claimed_at = NULL WHERE id = %s",
                 (job_id,),
             )

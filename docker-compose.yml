@@ -1,13 +1,81 @@
 services:
-  job-agent-api:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: talentalign
+      POSTGRES_USER: talentalign
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-talentalign-local}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talentalign -d talentalign"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+  api:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    container_name: sastra_job_agent_api
-    ports:
-      - "8000:8000"
-    environment:
+    environment: &app-environment
       PYTHONUNBUFFERED: "1"
-      DATABASE_URL: postgresql://talentalign:change-me@host.docker.internal:5432/talentalign
-      OLLAMA_URL: http://host.docker.internal:11434
+      DATABASE_URL: postgresql://talentalign:${POSTGRES_PASSWORD:-talentalign-local}@postgres:5432/talentalign
+      TALENTALIGN_API_TOKEN: ${TALENTALIGN_API_TOKEN:-}
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}
+      EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      EMBEDDING_DIMENSIONS: "384"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8000:8000"
+    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 60s
     restart: unless-stopped
+
+  enrich:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment: *app-environment
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "apps.worker.enrich"]
+    restart: unless-stopped
+
+  ingest:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment: *app-environment
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "apps.worker.ingest"]
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  ollama-data:
