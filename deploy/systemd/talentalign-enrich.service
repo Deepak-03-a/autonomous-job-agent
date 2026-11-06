@@ -1,0 +1,17 @@
+[Unit]
+Description=TalentAlign enrichment worker
+After=network-online.target postgresql.service ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=talentalign
+WorkingDirectory=/opt/talentalign/backend
+EnvironmentFile=/etc/talentalign/talentalign.env
+ExecStart=/opt/talentalign/.venv/bin/python -m apps.worker.enrich
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
