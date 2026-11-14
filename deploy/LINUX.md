@@ -13,6 +13,11 @@ TALENTALIGN_API_TOKEN=replace-with-a-long-random-token
 OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=llama3.2:3b
 OLLAMA_KEEP_ALIVE=10m
+JSEARCH_API_KEY=
+JSEARCH_QUERIES=["software engineer in India","data analyst in India","devops engineer in India","product manager in India"]
+ADZUNA_APP_ID=
+ADZUNA_API_KEY=
+ADZUNA_COUNTRY=in
 EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 TALENTALIGN_BACKUP_DIR=/var/backups/talentalign
 ```
@@ -95,6 +100,22 @@ separate `talentalign-enrich.service`. MiniLM remains responsible for vectors,
 so Ollama is not involved in ranking requests. If Ollama is stopped, chat
 returns a database-only summary and the enrichment worker retries pending
 jobs on its next poll.
+
+## Multi-board sources
+
+The built-in public sources cover Arbeitnow, Remotive, Himalayas, Jobicy, and
+Remote OK. Jobicy and Remote OK allow public feed access and require source
+credit and links to their listing pages. To add listings aggregated from
+LinkedIn, Indeed, Glassdoor, Monster, and other boards, create a JSearch
+RapidAPI subscription and set `JSEARCH_API_KEY`. Configure `JSEARCH_QUERIES`
+to choose the role families ingested every six hours. An Adzuna application ID
+and key can also enable that source. Credentials belong in the server
+environment; Ollama analyzes/ranks ingested listings but does not fetch jobs.
+
+LinkedIn and Indeed access is subject to their partner/API terms. Their
+official APIs do not provide an unrestricted public job-search endpoint for
+this app, so those publishers are available here through JSearch only when its
+key and subscription permit them.
 
 When `TALENTALIGN_API_TOKEN` is set, opening the dashboard issues a random,
 same-site HttpOnly session cookie for its API requests. PostgreSQL stores only
