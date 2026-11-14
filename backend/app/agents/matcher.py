@@ -39,7 +39,7 @@ class HybridJobMatcherAgent:
             try:
                 from sentence_transformers import SentenceTransformer
 
-                self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+                self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
             except Exception:
                 self._embedder_failed = True
                 self.embedder = None

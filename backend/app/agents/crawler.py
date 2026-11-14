@@ -97,6 +97,17 @@ class MarketDiscoveryAgent:
             "country_param": "country",
             "page_size": 20,
         },
+        {
+            "name": "Jobicy",
+            "url": "https://jobicy.com/api/jobs",
+            "pagination": "cursor",
+            "page_size": 100,
+        },
+        {
+            "name": "Remote OK",
+            "url": "https://remoteok.com/api",
+            "pagination": "none",
+        },
     )
 
     ROLE_TERMS = {
@@ -190,7 +201,7 @@ class MarketDiscoveryAgent:
             cursor = None
             page = 1
             while max_pages is None or page <= max_pages:
-                params: dict[str, Any] = {"limit": 20}
+                params: dict[str, Any] = {"count": source.get("page_size", 100)}
                 if cursor:
                     params["cursor"] = cursor
                 payload = self._request_json(source["url"], params)
@@ -202,6 +213,11 @@ class MarketDiscoveryAgent:
                 if not cursor:
                     return
                 page += 1
+            return
+
+        if source.get("pagination") == "none":
+            payload = self._request_json(source["url"], {})
+            yield from self._records_from_payload(payload)
             return
 
         seen_page_keys: set[str] = set()
@@ -407,7 +423,7 @@ class MarketDiscoveryAgent:
         source_name: str,
         source_url: str,
     ) -> dict[str, Any] | None:
-        title = self._text(record.get("title") or record.get("position")).strip()
+        title = self._text(record.get("title") or record.get("position") or record.get("jobTitle")).strip()
         company = self._text(
             record.get("company_name")
             or record.get("companyName")
@@ -424,7 +440,7 @@ class MarketDiscoveryAgent:
             return None
 
         description = self._text(
-            record.get("description") or record.get("excerpt") or record.get("summary")
+            record.get("description") or record.get("jobDescription") or record.get("jobExcerpt") or record.get("excerpt") or record.get("summary")
         )
         description = " ".join(BeautifulSoup(description, "html.parser").get_text(" ").split())
         restrictions = record.get("locationRestrictions")
@@ -432,6 +448,7 @@ class MarketDiscoveryAgent:
             record.get("location")
             or record.get("candidate_required_location")
             or record.get("locations")
+            or record.get("jobGeo")
             or restrictions
         )
         if isinstance(location_value, list) and all(isinstance(item, dict) for item in location_value):
@@ -443,7 +460,13 @@ class MarketDiscoveryAgent:
             location = self._text(location_value).strip()
         if source_name.lower() == "himalayas" and not location:
             location = "Worldwide remote"
-        remote = bool(record.get("remote")) or source_name.lower() == "himalayas" or "remote" in f"{location} {title}".lower()
+        source_lower = source_name.lower()
+        location_title = f"{location} {title}".lower()
+        remote = (
+            bool(record.get("remote"))
+            or source_lower in {"himalayas", "jobicy", "remote ok"}
+            or any(term in location_title for term in ("remote", "worldwide", "global", "anywhere"))
+        )
         full_text = f"{title} {description}"
         weights = {
             skill: SKILL_TAXONOMY_WEIGHTS[skill]
@@ -452,7 +475,6 @@ class MarketDiscoveryAgent:
         if not weights:
             weights = {"general": 1.0}
 
-        source_lower = source_name.lower()
         startup_source = any(term in source_lower for term in ("wellfound", "startup"))
         startup_flag = bool(record.get("startup") or record.get("is_startup")) or startup_source
         raw_id = f"{source_name}|{url}".encode("utf-8")
@@ -469,7 +491,7 @@ class MarketDiscoveryAgent:
             "country": "India" if self._matches_country_text(location, "India") else "",
             "is_startup": startup_flag,
             "posted_at": self._text(
-                record.get("publication_date") or record.get("pubDate") or record.get("created_at")
+                record.get("publication_date") or record.get("pubDate") or record.get("date") or record.get("created_at")
             ),
             "req_years": self._required_years(full_text),
             "description": description or title,
@@ -495,7 +517,7 @@ class MarketDiscoveryAgent:
                 for city in (
                     "bangalore", "bengaluru", "mumbai", "delhi", "hyderabad",
                     "chennai", "pune", "kolkata", "noida", "gurgaon", "gurugram",
-                    "ahmedabad", "jaipur", "kochi", "india",
+                    "ahmedabad", "jaipur", "kochi", "india", "apac", "asia pacific",
                 )
             )
         return False

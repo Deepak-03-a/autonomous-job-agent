@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY backend/requirements.txt ./requirements.txt
 # Install the CPU wheel explicitly before sentence-transformers so pip does not
 # select CUDA libraries on the CPU-only Linux host.
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torch==2.5.1+cpu"
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend ./

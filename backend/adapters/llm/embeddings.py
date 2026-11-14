@@ -16,7 +16,7 @@ class MiniLMEmbedder:
                 if self._model is None:
                     from sentence_transformers import SentenceTransformer
 
-                    self._model = SentenceTransformer(self.model_name)
+                    self._model = SentenceTransformer(self.model_name, device="cpu")
         return self._model
 
     def encode(self, texts: list[str]) -> list[list[float]]:
