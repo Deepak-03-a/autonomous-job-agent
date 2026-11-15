@@ -2,6 +2,7 @@ import os
 import json
 import secrets
 import threading
+from datetime import date
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +10,11 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.database import init_db, get_db
+from adapters.imports.linkedin_zip import ExportError, read_export
+from core.domains import domain_dicts, predict_domains, target_roles
+from app.services.agent import run_agent
+from app.services.ranking import NoProfile
+from core.linkedin import combine, parse_tables
 from app.agents.parser import ResumeParserAgent, SKILL_TAXONOMY_WEIGHTS, extract_skills_from_text
 from app.agents.crawler import EthicalCrawlerAgent, MarketDiscoveryAgent
 from app.agents.matcher import HybridJobMatcherAgent, build_market_brief
@@ -17,6 +23,9 @@ from core.config import settings
 from adapters.db.app_store import PostgresApplicationStore
 from adapters.llm.embeddings import MiniLMEmbedder
 from adapters.llm.ollama import OllamaClient
+from app.services.context import AgentContext
+from app.services.grounding import evidence_grounded
+from app.services.ranking import job_payload, load_profile, rank_market as rank_market_for
 
 app = FastAPI(
     title="Autonomous Multi-Agent Job Alignment & Career Portal",
@@ -47,6 +56,8 @@ RESUME_EMBEDDER = MiniLMEmbedder(settings.embedding_model, settings.embedding_di
 POSTGRES_MIGRATION = APP_ROOT.parent / "adapters" / "db" / "migrations" / "001_initial.sql"
 if not POSTGRES_MIGRATION.exists():
     POSTGRES_MIGRATION = PROJECT_ROOT / "backend" / "adapters" / "db" / "migrations" / "001_initial.sql"
+POSTGRES_MIGRATIONS = sorted(POSTGRES_MIGRATION.parent.glob("*.sql"))
+MAX_EXPORT_BYTES = int(os.getenv("MAX_EXPORT_BYTES", str(25 * 1024 * 1024)))
 
 if STATIC_ROOT.exists():
     app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
@@ -71,7 +82,8 @@ async def optional_api_token(request: Request, call_next):
 @app.on_event("startup")
 def startup_event():
     if POSTGRES_STORE is not None:
-        POSTGRES_STORE.migrate(POSTGRES_MIGRATION)
+        for migration in POSTGRES_MIGRATIONS:
+            POSTGRES_STORE.migrate(migration)
     else:
         init_db()
     # The embedding model is optional. Warm it in the background so the API
@@ -84,6 +96,19 @@ market_agent = MarketDiscoveryAgent()
 matcher_agent = HybridJobMatcherAgent(alpha=0.60, decay_lambda=0.35)
 advisor_agent = SkillGapAdvisorAgent()
 ollama_client = OllamaClient(settings.ollama_url, settings.ollama_model, keep_alive=settings.ollama_keep_alive)
+
+
+def build_agent_context() -> AgentContext:
+    """Build a fresh context so agent caches are isolated to one request."""
+    short = lambda seconds: OllamaClient(
+        settings.ollama_url, settings.ollama_model,
+        timeout=seconds, keep_alive=settings.ollama_keep_alive,
+    )
+    return AgentContext(
+        postgres=POSTGRES_STORE, get_db=get_db, matcher=matcher_agent,
+        advisor=advisor_agent, embedder=RESUME_EMBEDDER,
+        planner_llm=short(30.0), narrator_llm=short(45.0),
+    )
 
 @app.get("/", response_class=HTMLResponse)
 def read_dashboard(request: Request):
@@ -182,10 +207,9 @@ def chat_about_match(payload: dict):
         try:
             result = ollama_client.explain(question, context)
             evidence = result["evidence"]
-            context_text = json.dumps(context, ensure_ascii=False)
             # Only display generated text when every claimed evidence snippet
             # is present in the stored context.
-            if not evidence or any(not isinstance(item, str) or item not in context_text for item in evidence):
+            if not evidence_grounded(evidence, context):
                 raise ValueError("Explanation evidence did not match stored data")
             return {"answer": result["answer"], "source": "ollama", "evidence": evidence}
         except Exception:
@@ -200,15 +224,24 @@ async def parse_resume_pdf(file: UploadFile = File(...), user_id: int = Form(1))
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
     pdf_bytes = await file.read()
     parsed_data = parser_agent.parse_pdf_bytes(pdf_bytes)
-    
+    domains = predict_domains(parsed_data["skills"])
+    roles = target_roles(domains)
+
     if POSTGRES_STORE is not None:
-        resume_id = POSTGRES_STORE.insert_resume(file.filename, parsed_data, user_id)
+        resume_id = POSTGRES_STORE.insert_resume(
+            file.filename,
+            parsed_data,
+            user_id,
+            extras={"domains": _domain_dicts(domains), "target_roles": roles},
+        )
     else:
         db = get_db()
         cursor = db.cursor()
         cursor.execute(
-            "INSERT INTO resumes (user_id, filename, raw_text, exp_years, skills_json) VALUES (?, ?, ?, ?, ?)",
-            (user_id, file.filename, parsed_data["raw_text"], parsed_data["exp_years"], json.dumps(parsed_data["skills"]))
+            "INSERT INTO resumes (user_id, filename, raw_text, exp_years, skills_json, extras_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, file.filename, parsed_data["raw_text"], parsed_data["exp_years"],
+             json.dumps(parsed_data["skills"]),
+             json.dumps({"domains": _domain_dicts(domains), "target_roles": roles}))
         )
         db.commit()
         resume_id = cursor.lastrowid
@@ -220,7 +253,107 @@ async def parse_resume_pdf(file: UploadFile = File(...), user_id: int = Form(1))
         "filename": file.filename,
         "detected_experience_years": parsed_data["exp_years"],
         "detected_skills": parsed_data["skills"],
+        "predicted_domains": _domain_dicts(domains),
+        "target_roles": roles,
         "preview": parsed_data["raw_text"][:500]
+    }
+
+
+_domain_dicts = domain_dicts
+
+
+@app.post("/api/v1/profile/linkedin-export")
+async def import_linkedin_export(file: UploadFile = File(...), resume_id: int | None = Form(None)):
+    """Merge a LinkedIn account data export into the candidate's saved profile."""
+    if not (file.filename or "").lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Upload the .zip file LinkedIn emailed you.")
+    data = await file.read(MAX_EXPORT_BYTES + 1)
+    if len(data) > MAX_EXPORT_BYTES:
+        raise HTTPException(status_code=413, detail="The LinkedIn export exceeds the upload size limit.")
+    try:
+        tables, warnings, files_read = read_export(data)
+    except ExportError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    if not any(tables.get(name) for name in ("positions", "skills", "profile")):
+        raise HTTPException(status_code=400, detail="No LinkedIn profile, positions, or skills files were found.")
+
+    today = date.today()
+    profile = parse_tables(tables)
+    if POSTGRES_STORE is not None:
+        base = POSTGRES_STORE.get_resume(resume_id) if resume_id is not None else POSTGRES_STORE.latest_resume()
+        base_skills = list(base["skills"]) if base else []
+    else:
+        db = get_db()
+        try:
+            row = (
+                db.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
+                if resume_id is not None
+                else db.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
+            )
+            base = dict(row) if row else None
+        finally:
+            db.close()
+        base_skills = json.loads(base.get("skills_json") or "[]") if base else []
+    if resume_id is not None and base is None:
+        raise HTTPException(status_code=404, detail="Resume record not found.")
+
+    combined = combine(
+        base["raw_text"] if base else "",
+        base_skills,
+        base["exp_years"] if base else None,
+        profile,
+        today,
+    )
+    domains = predict_domains(combined.skills, profile.role_spans(today), profile.headline)
+    hints = [value.casefold() for value in (profile.preferred_titles + profile.alert_phrases)][:10]
+    roles = list(dict.fromkeys(hints + target_roles(domains)))[:15]
+    filename = f"linkedin-export ({base['filename']})" if base and base.get("filename") else "linkedin-export"
+    parsed = {"raw_text": combined.raw_text, "exp_years": combined.experience_years, "skills": combined.skills}
+    extras = {
+        "source": "linkedin_export",
+        "domains": _domain_dicts(domains),
+        "target_roles": roles,
+        "extra_skills": combined.extra_skills,
+        "alert_phrases": profile.alert_phrases[:20],
+        "saved_jobs": profile.saved_jobs[:200],
+        "applications": profile.applications[:200],
+        "experience_source": combined.experience_source,
+    }
+    if POSTGRES_STORE is not None:
+        new_id = POSTGRES_STORE.insert_resume(filename, parsed, 1, extras=extras)
+    else:
+        db = get_db()
+        try:
+            cursor = db.execute(
+                "INSERT INTO resumes (user_id, filename, raw_text, exp_years, skills_json, extras_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (1, filename, parsed["raw_text"], parsed["exp_years"], json.dumps(parsed["skills"]), json.dumps(extras)),
+            )
+            new_id = cursor.lastrowid
+            db.commit()
+        finally:
+            db.close()
+
+    return {
+        "status": "success",
+        "resume_id": new_id,
+        "filename": filename,
+        "files_read": files_read,
+        "warnings": warnings,
+        "headline": profile.headline,
+        "experience": {"years": combined.experience_years, "source": combined.experience_source},
+        "positions": [{
+            "title": position.title,
+            "company": position.company,
+            "start": position.start.isoformat() if position.start else None,
+            "end": position.end.isoformat() if position.end else None,
+        } for position in profile.positions],
+        "skills": combined.skills,
+        "extra_skills": combined.extra_skills,
+        "predicted_domains": _domain_dicts(domains),
+        "target_roles": roles,
+        "saved_jobs": len(profile.saved_jobs),
+        "applications": len(profile.applications),
+        "alert_phrases": profile.alert_phrases[:20],
     }
 
 @app.post("/api/v1/market/discover")
@@ -437,110 +570,54 @@ def evaluate_matches(resume_id: int = Form(1), job_id: int = Form(1)):
     }
 
 
-def _job_payload(row) -> dict:
-    try:
-        weights = json.loads(row["weights_json"] or "{}")
-    except json.JSONDecodeError:
-        weights = {}
-    if not isinstance(weights, dict):
-        weights = {}
-    return {
-        "id": row["id"],
-        "title": row["title"] or "",
-        "company": row["company"] or "",
-        "url": row["url"] or "",
-        "description": row["description"] or "",
-        "req_years": row["req_years"] or 0.0,
-        "weights": weights,
-        "location": row["location"] or "",
-        "country": row["country"] or "",
-        "source": row["source"] or "",
-        "is_startup": bool(row["is_startup"]),
-        "posted_at": row["posted_at"] or "",
-    }
+_job_payload = job_payload  # kept for the other endpoints in this module
 
 
 @app.post("/api/v1/rank-market")
 def rank_market(resume_id: int = Form(1)):
     """Score every stored opening and attach the skill that would move each match."""
-    db = None
+    ctx = build_agent_context()
+    profile = load_profile(ctx, resume_id, fallback_latest=True)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Upload a resume before ranking the market.")
+    ranking = rank_market_for(ctx, profile)
+    if not ranking.matches:
+        return {"status": "success", "resume_id": profile["id"], "semantic_mode": "no_jobs",
+                "total_ranked": 0, "market_brief": {}, "matches": []}
+    return {"status": "success", "resume_id": profile["id"], "semantic_mode": ranking.semantic_mode,
+            "total_ranked": len(ranking.matches), "market_brief": ranking.market_brief, "matches": ranking.matches}
+
+
+# ---------------------------------------------------------------------------
+# Job-search agent: plan, run deterministic tools, report. See app/services/agent.py.
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/agent/run")
+def agent_run(goal: str = Form(""), resume_id: int | None = Form(None),
+              planner: str = Form("auto"), narrative: str = Form("auto")):
+    """Run the job-search agent for your newest profile (or the given resume_id)."""
+    if len(goal) > 500:
+        raise HTTPException(status_code=400, detail="The goal must be 500 characters or fewer.")
+    if planner not in ("auto", "fixed") or narrative not in ("auto", "off"):
+        raise HTTPException(status_code=400, detail="planner is auto|fixed and narrative is auto|off.")
     try:
-        if POSTGRES_STORE is not None:
-            resume = POSTGRES_STORE.get_resume(resume_id) or POSTGRES_STORE.latest_resume()
-            rows = (
-                POSTGRES_STORE.search_jobs_by_embedding(
-                    RESUME_EMBEDDER.encode([resume["raw_text"]])[0],
-                    limit=100,
-                )
-                if resume else []
-            )
-        else:
-            db = get_db()
-            cursor = db.cursor()
-            resume = cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,)).fetchone()
-            if not resume:
-                resume = cursor.execute("SELECT * FROM resumes ORDER BY id DESC LIMIT 1").fetchone()
-            rows = cursor.execute("SELECT * FROM jobs ORDER BY id ASC").fetchall()
-        if not resume:
-            raise HTTPException(status_code=404, detail="Upload a resume before ranking the market.")
+        result = run_agent(build_agent_context(), goal, resume_id, planner, narrative)
+    except NoProfile as error:
+        raise HTTPException(status_code=404, detail=str(error))
+    run_id = None
+    if POSTGRES_STORE is not None:
+        run_id = POSTGRES_STORE.insert_agent_run(result["goal"], result["planner"]["mode"], result["status"],
+                                                 result["trace"], result["report"])
+    return {"run_id": run_id, **result}
 
-        if not rows:
-            return {
-                "status": "success",
-                "resume_id": resume["id"],
-                "semantic_mode": "no_jobs",
-                "total_ranked": 0,
-                "market_brief": {},
-                "matches": [],
-            }
 
-        resume_skills = resume["skills"] if POSTGRES_STORE is not None else json.loads(resume["skills_json"] or "[]")
-        jobs = [_job_payload(row) for row in rows]
-        ranked, semantic_mode = matcher_agent.rank_jobs(
-            resume["raw_text"] or "",
-            resume_skills,
-            resume["exp_years"] or 0.0,
-            jobs,
-        )
+@app.get("/api/v1/agent/runs")
+def agent_runs(limit: int = 20):
+    return {"runs": POSTGRES_STORE.list_agent_runs(limit) if POSTGRES_STORE is not None else []}
 
-        matches = []
-        for item in ranked:
-            job = item["job"]
-            evaluation = item["evaluation"]
-            advice = advisor_agent.generate_advice(
-                resume_skills,
-                job["weights"],
-                job_title=job["title"],
-                score_lifts=evaluation["skill_lifts"],
-            )
-            matches.append({
-                "job_id": job["id"],
-                "company_details": {
-                    "company_name": job["company"],
-                    "role_title": job["title"],
-                    "portal_url": job["url"],
-                    "required_experience_years": job["req_years"],
-                    "location": job["location"],
-                    "source": job["source"],
-                    "is_startup": job["is_startup"],
-                },
-                "candidate_profile": {
-                    "detected_experience_years": resume["exp_years"],
-                    "matched_skills": advice["matched_skills"],
-                    "missing_skills": advice["missing_skills"],
-                },
-                "evaluation": evaluation,
-                "advisory": advice,
-            })
 
-        return {
-            "status": "success",
-            "resume_id": resume["id"],
-            "semantic_mode": semantic_mode,
-            "total_ranked": len(matches),
-            "market_brief": build_market_brief(ranked),
-            "matches": matches,
-        }
-    finally:
-        if db is not None:
-            db.close()
+@app.get("/api/v1/agent/runs/{run_id}")
+def agent_run_detail(run_id: int):
+    row = POSTGRES_STORE.get_agent_run(run_id) if POSTGRES_STORE is not None else None
+    if row is None:
+        raise HTTPException(status_code=404, detail="That run was not found (runs are saved only with PostgreSQL).")
+    return row

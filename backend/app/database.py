@@ -31,9 +31,16 @@ def init_db():
             raw_text TEXT,
             exp_years REAL,
             skills_json TEXT,
+            extras_json TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+
+    resume_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(resumes)").fetchall()
+    }
+    if "extras_json" not in resume_columns:
+        cursor.execute("ALTER TABLE resumes ADD COLUMN extras_json TEXT NOT NULL DEFAULT '{}'")
     
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS jobs (
