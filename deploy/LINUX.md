@@ -20,12 +20,13 @@ ADZUNA_API_KEY=
 ADZUNA_COUNTRY=in
 EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 TALENTALIGN_BACKUP_DIR=/var/backups/talentalign
+MAX_EXPORT_BYTES=26214400
 ```
 
-Run the PostgreSQL migration from `/opt/talentalign/backend`:
+Apply all PostgreSQL migrations from `/opt/talentalign` (the API also applies them on startup):
 
 ```bash
-python -c "from adapters.db.postgres import PostgresStore; from core.config import settings; PostgresStore(settings.database_url).migrate('adapters/db/migrations/001_initial.sql')"
+cd /opt/talentalign/backend && python -c "from pathlib import Path; from adapters.db.app_store import PostgresApplicationStore; from core.config import settings; store=PostgresApplicationStore(settings.database_url); [store.migrate(p) for p in sorted(Path('adapters/db/migrations').glob('*.sql'))]"
 ```
 
 Install and enable the units:
@@ -121,3 +122,51 @@ When `TALENTALIGN_API_TOKEN` is set, opening the dashboard issues a random,
 same-site HttpOnly session cookie for its API requests. PostgreSQL stores only
 the session token hash, so the shared API token stays in the server `.env` and
 does not need to be copied into browser storage. Sessions expire after 30 days.
+
+## Import your LinkedIn data
+
+TalentAlign does not log into or scrape LinkedIn. Download your own account
+archive from LinkedIn's **Settings → Data privacy → Get a copy of your data**.
+The importer reads only profile, positions, skills, education, certifications,
+saved jobs, applications, alerts, and job-seeker preference CSVs. It processes
+the zip in memory and skips files over 5 MB; the upload limit defaults to 25 MB.
+
+You can upload the archive through the authenticated API and optionally merge it
+with an existing resume profile:
+
+```bash
+curl -H "Authorization: Bearer $TALENTALIGN_API_TOKEN" \
+     -F "file=@Basic_LinkedInDataExport.zip" \
+     https://jobbox.<your-tailnet>.ts.net/api/v1/profile/linkedin-export
+```
+
+The response includes imported positions, combined skills, experience estimate,
+predicted role domains, and target search roles. Alert phrases from the archive
+are prioritized. `TARGET_ROLES` in the server environment overrides predicted
+roles for ingestion. Imported profile details are stored with the resume record;
+the original zip is not retained.
+
+## Run the job-search agent
+
+The agent reads the latest saved resume or LinkedIn profile, checks which
+providers supplied stored jobs, ranks matches, identifies high impact skill
+gaps, and returns a report with an execution trace.
+
+```bash
+# Fixed pipeline; does not ask Ollama to plan
+curl -H "Authorization: Bearer $TALENTALIGN_API_TOKEN" -X POST \
+     https://jobbox.<your-tailnet>.ts.net/api/v1/agent/run
+
+# A natural-language goal; Ollama selects from validated tools
+curl -H "Authorization: Bearer $TALENTALIGN_API_TOKEN" \
+     -F "goal=remote jobs that need Terraform" \
+     https://jobbox.<your-tailnet>.ts.net/api/v1/agent/run
+```
+
+Set `planner=fixed` to skip planning, `narrative=off` to skip the model-written
+summary, or `resume_id=N` to select a saved profile. PostgreSQL deployments
+retain runs at `GET /api/v1/agent/runs` and `GET /api/v1/agent/runs/{id}`.
+Ollama can choose only validated tools and filters; job records and scores come
+from the database and deterministic ranking code. Generated summaries are
+shown only when their evidence and numbers are grounded in report data. If
+Ollama is unavailable or returns an invalid plan, the fixed pipeline runs.

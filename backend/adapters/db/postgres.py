@@ -177,3 +177,23 @@ class PostgresStore:
                 "UPDATE jobs SET enrichment_claimed_at = NULL WHERE id = %s",
                 (job_id,),
             )
+
+    def latest_resume_profile(self) -> dict[str, list[str]]:
+        """Return the newest candidate's skills and predicted search roles."""
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT skills, extras FROM resumes ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return {"skills": [], "target_roles": []}
+        skills = row.get("skills") or []
+        extras = row.get("extras") or {}
+        roles = extras.get("target_roles", []) if isinstance(extras, dict) else []
+        return {
+            "skills": [str(value) for value in skills] if isinstance(skills, list) else [],
+            "target_roles": [str(value) for value in roles] if isinstance(roles, list) else [],
+        }
+
+    def latest_resume_skills(self) -> list[str]:
+        """Compatibility helper for callers that only need skill names."""
+        return self.latest_resume_profile()["skills"]

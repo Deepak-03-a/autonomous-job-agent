@@ -43,6 +43,7 @@ services:
       ADZUNA_APP_ID: ${ADZUNA_APP_ID:-}
       ADZUNA_API_KEY: ${ADZUNA_API_KEY:-}
       ADZUNA_COUNTRY: ${ADZUNA_COUNTRY:-in}
+      MAX_EXPORT_BYTES: ${MAX_EXPORT_BYTES:-26214400}
     depends_on:
       postgres:
         condition: service_healthy

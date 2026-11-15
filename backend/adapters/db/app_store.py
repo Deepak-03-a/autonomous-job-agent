@@ -37,23 +37,71 @@ class PostgresApplicationStore:
     def get_resume(self, resume_id: int) -> dict[str, Any] | None:
         with self._connect() as connection:
             return connection.execute(
-                "SELECT id, raw_text, exp_years, skills FROM resumes WHERE id = %s",
+                "SELECT id, filename, raw_text, exp_years, skills, extras FROM resumes WHERE id = %s",
                 (resume_id,),
             ).fetchone()
 
     def latest_resume(self) -> dict[str, Any] | None:
         with self._connect() as connection:
             return connection.execute(
-                "SELECT id, raw_text, exp_years, skills FROM resumes ORDER BY id DESC LIMIT 1"
+                "SELECT id, filename, raw_text, exp_years, skills, extras FROM resumes ORDER BY id DESC LIMIT 1"
             ).fetchone()
 
-    def insert_resume(self, filename: str, parsed: dict[str, Any], user_id: int = 1) -> int:
+    def insert_agent_run(self, goal: str, planner: str, status: str, trace: list, report: dict) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """INSERT INTO agent_runs(goal, planner, status, trace, report)
+                   VALUES (%s, %s, %s, %s::jsonb, %s::jsonb) RETURNING id""",
+                (goal, planner, status, json.dumps(trace, default=str), json.dumps(report, default=str)),
+            ).fetchone()
+            return int(row["id"])
+
+    def get_agent_run(self, run_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT id, goal, planner, status, trace, report, created_at FROM agent_runs WHERE id = %s",
+                (run_id,),
+            ).fetchone()
+
+    def list_agent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            return list(connection.execute(
+                """SELECT id, goal, planner, status, created_at,
+                          jsonb_array_length(trace) AS steps
+                   FROM agent_runs ORDER BY id DESC LIMIT %s""",
+                (min(max(limit, 1), 100),),
+            ).fetchall())
+
+    def job_stats(self) -> dict[str, Any]:
+        """Return stored job counts by provider and the latest ingestion runs."""
+        with self._connect() as connection:
+            providers = connection.execute(
+                """SELECT COALESCE(NULLIF(provider, ''), source) AS provider,
+                          count(*) FILTER (WHERE status = 'open') AS open_jobs,
+                          max(last_seen) AS last_seen
+                   FROM jobs GROUP BY 1 ORDER BY open_jobs DESC, provider"""
+            ).fetchall()
+            runs = connection.execute(
+                """SELECT source, status, fetched, new_count, finished_at
+                   FROM ingestion_runs WHERE status <> 'running'
+                   ORDER BY id DESC LIMIT 10"""
+            ).fetchall()
+        return {"providers": [dict(row) for row in providers],
+                "recent_runs": [dict(row) for row in runs]}
+
+    def insert_resume(
+        self,
+        filename: str,
+        parsed: dict[str, Any],
+        user_id: int = 1,
+        extras: dict[str, Any] | None = None,
+    ) -> int:
         del user_id  # PostgreSQL schema uses candidate profiles; auth is API-level.
         with self._connect() as connection:
             row = connection.execute(
                 """
-                INSERT INTO resumes(filename, raw_text, exp_years, skills)
-                VALUES (%s, %s, %s, %s::jsonb)
+                INSERT INTO resumes(filename, raw_text, exp_years, skills, extras)
+                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb)
                 RETURNING id
                 """,
                 (
@@ -61,6 +109,7 @@ class PostgresApplicationStore:
                     parsed["raw_text"],
                     parsed["exp_years"],
                     json.dumps(parsed["skills"]),
+                    json.dumps(extras or {}),
                 ),
             ).fetchone()
             return int(row["id"])
