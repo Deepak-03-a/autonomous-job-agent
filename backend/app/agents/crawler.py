@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -22,10 +21,14 @@ except ImportError:  # Keep page parsing usable in a minimal test environment.
     httpx = None
 
 from app.agents.parser import SKILL_TAXONOMY_WEIGHTS, extract_skills_from_text
+from app.utils.ethics import public_request, robots_allows, validate_public_url
 
 
 class EthicalCrawlerAgent:
     """Fetch a job page and remove non-content DOM before storing it."""
+
+    MAX_REDIRECTS = 5
+    MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
     def prune_raw_html(self, raw_html: str) -> dict:
         raw_bytes = len(raw_html.encode("utf-8"))
@@ -49,24 +52,40 @@ class EthicalCrawlerAgent:
         }
 
     async def crawl_and_prune(self, url: str) -> dict:
-        if httpx is not None:
-            async with httpx.AsyncClient(
-                timeout=20.0,
-                follow_redirects=True,
-                headers={"User-Agent": "TalentAlignAI/3.0 job-discovery"},
-            ) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-            raw_html = response.text
-        else:
-            from urllib.request import Request, urlopen
-
-            def fetch_html() -> str:
-                request = Request(url, headers={"User-Agent": "TalentAlignAI/3.0 job-discovery"})
-                with urlopen(request, timeout=20) as response:
-                    return response.read().decode("utf-8", errors="replace")
-
-            raw_html = await asyncio.to_thread(fetch_html)
+        if httpx is None:
+            raise RuntimeError("The HTTP client is not installed.")
+        current_url = await validate_public_url(url)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20.0, connect=5.0),
+            follow_redirects=False,
+            trust_env=False,
+            headers={"User-Agent": "TalentAlignAI/3.0 job-discovery"},
+        ) as client:
+            for redirect_count in range(self.MAX_REDIRECTS + 1):
+                current_url = await validate_public_url(current_url)
+                if not await robots_allows(client, current_url):
+                    raise PermissionError("robots.txt does not allow this page to be fetched.")
+                response = await public_request(client, "GET", current_url, stream=True)
+                try:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location or redirect_count >= self.MAX_REDIRECTS:
+                            raise ValueError("The page redirected too many times or omitted its target.")
+                        from urllib.parse import urljoin
+                        current_url = urljoin(current_url, location)
+                        continue
+                    response.raise_for_status()
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > self.MAX_RESPONSE_BYTES:
+                            raise ValueError("The page is larger than the 5 MB fetch limit.")
+                    raw_html = bytes(body).decode(response.encoding or "utf-8", errors="replace")
+                    break
+                finally:
+                    await response.aclose()
+            else:
+                raise ValueError("The page redirected too many times.")
 
         result = self.prune_raw_html(raw_html)
         return {

@@ -7,9 +7,14 @@ the API, workers, PostgreSQL/pgvector, Ollama, and timers on Linux.
 
 Create `/etc/talentalign/talentalign.env`:
 
+Generate the API secret with `openssl rand -hex 32` and replace the placeholder
+below with its output (without angle brackets).
+
 ```dotenv
 DATABASE_URL=postgresql://talentalign:change-me@127.0.0.1:5432/talentalign
-TALENTALIGN_API_TOKEN=replace-with-a-long-random-token
+APP_ENV=production
+TALENTALIGN_API_TOKEN=<output of: openssl rand -hex 32>
+CORS_ORIGINS=
 OLLAMA_URL=http://127.0.0.1:11434
 OLLAMA_MODEL=llama3.2:3b
 OLLAMA_KEEP_ALIVE=10m
@@ -118,10 +123,20 @@ official APIs do not provide an unrestricted public job-search endpoint for
 this app, so those publishers are available here through JSearch only when its
 key and subscription permit them.
 
-When `TALENTALIGN_API_TOKEN` is set, opening the dashboard issues a random,
+The app queries JSearch's licensed API and may return listings attributed to
+LinkedIn, Indeed, Glassdoor, Monster, and other publishers. It does not log in
+to or directly scrape those publisher websites.
+
+`TALENTALIGN_API_TOKEN` is required to start the API; an absent value fails
+closed. Opening the dashboard issues a random,
 same-site HttpOnly session cookie for its API requests. PostgreSQL stores only
 the session token hash, so the shared API token stays in the server `.env` and
 does not need to be copied into browser storage. Sessions expire after 30 days.
+Production requires PostgreSQL; SQLite remains available for tests and local
+development. Configure exact `CORS_ORIGINS` only for a separate frontend origin.
+
+Company ATS entries in `COMPANY_SOURCES` support `greenhouse`, `lever`, `ashby`,
+and `smartrecruiters` provider keys.
 
 ## Import your LinkedIn data
 
@@ -170,3 +185,36 @@ Ollama can choose only validated tools and filters; job records and scores come
 from the database and deterministic ranking code. Generated summaries are
 shown only when their evidence and numbers are grounded in report data. If
 Ollama is unavailable or returns an invalid plan, the fixed pipeline runs.
+
+### The dashboard's agent panel
+
+The dashboard has a "Job agent" section (nav link, or `#agent`). It needs no extra
+setup: it is served by the API like the rest of the page.
+
+- Type a goal in your own words (or leave it empty for the standard pipeline) and
+  press Run agent. "Planning: Fixed pipeline only" never calls the model; unticking
+  "Write a short summary" skips the model's summary.
+- The result shows a summary (labelled "Summary checked against your data" only when
+  the model's quotes and numbers were verified, otherwise "Standard summary"), your
+  predicted domains, the best matches, the skills that would move the most roles, the
+  data sources and the policy statement explaining that the app does not log in to or
+  directly scrape LinkedIn or Indeed (licensed aggregator listings may still be attributed
+  to those boards), plus a collapsible step-by-step trace. A match opens to show what you have, what to learn
+  (with the point gain) and a link to the employer's own page.
+- "Import LinkedIn data (.zip)" uploads your own LinkedIn export (see above) and
+  makes it your newest profile.
+- With PostgreSQL, "Recent runs" lists saved runs; click one to reopen it.
+
+Links are shown only if they are http(s). Text from jobs and from the model is always
+shown as plain text. Only `frontend/src` is served to the browser.
+
+Component tests (development only; the page itself needs no build step):
+
+```bash
+cd frontend && npm ci && npm test
+```
+
+They render the panel in a simulated browser, load the page the way the browser does
+(React plus Babel standalone, both scripts in one scope), and check what appears.
+They do not check how it looks; open the dashboard once on your Windows laptop and
+look at it, including a narrow window.

@@ -20,7 +20,7 @@ import httpx
 
 from app.services.context import AgentContext
 from app.services.grounding import evidence_grounded, numbers_grounded
-from app.services.ranking import NoProfile, job_payload, load_profile, rank_market
+from app.services.ranking import NoProfile, job_payload, load_profile, rank_market, retrieval_profile_text
 from core.domains import domain_dicts, predict_domains, target_roles
 from urllib.parse import urlsplit
 
@@ -39,9 +39,11 @@ def safe_http_url(value: Any) -> str:
 MAX_STEPS = 6
 DEFAULT_GOAL = "find the best jobs for my profile"
 LLM_COOLDOWN_SECONDS = 60
-POLICY = ("Jobs come only from the providers listed above (official job-board APIs, company career "
-          "pages read within robots.txt, and public feeds). Your profile comes from your own resume and "
-          "LinkedIn data export. This app never logs in to, or scrapes, LinkedIn or Indeed.")
+POLICY = ("Job listings come from configured official ATS APIs, public feeds, direct company pages "
+          "checked against robots.txt, and licensed aggregators such as JSearch when configured. "
+          "An aggregator may return listings attributed to LinkedIn, Indeed, Glassdoor, or other boards; "
+          "this app calls the aggregator API and does not log in to or directly scrape those board sites. "
+          "Profile data comes from your resume or the LinkedIn archive you upload.")
 
 
 class ToolArgError(ValueError):
@@ -103,10 +105,11 @@ def validate_args(tool: Tool, args: Any) -> dict:
 
 
 # --------------------------------------------------------------------- tools
-def _ranking(ctx: AgentContext):
-    if "ranking" not in ctx.cache:
-        ctx.cache["ranking"] = rank_market(ctx, ctx.cache["profile"])
-    return ctx.cache["ranking"]
+def _ranking(ctx: AgentContext, filters: dict | None = None):
+    key = "ranking" if not filters else "ranking:" + json.dumps(filters, sort_keys=True)
+    if key not in ctx.cache:
+        ctx.cache[key] = rank_market(ctx, ctx.cache["profile"], filters)
+    return ctx.cache[key]
 
 
 def _get_profile(ctx, args):
@@ -138,7 +141,12 @@ _QUEUES = ["Apply now", "One skill away", "Stretch", "Build toward"]
 
 
 def _find_jobs(ctx, a):
-    ranking = _ranking(ctx)
+    retrieval_filters = {
+        key: a[key] for key in
+        ("remote_only", "location_contains", "company_contains", "max_required_years", "must_have_skill")
+        if key in a
+    }
+    ranking = _ranking(ctx, retrieval_filters)
     found = []
     for item, match in zip(ranking.ranked, ranking.matches):
         job, ev, d = item["job"], match["evaluation"], match["company_details"]
@@ -200,7 +208,7 @@ def _explain_job(ctx, a):
             raise ToolError(f"job {a['job_id']} was not found")
         job = job_payload(row)
         ev = ctx.matcher.evaluate_job_match(
-            resume_text=profile["raw_text"], job_text=job["description"], resume_skills=profile["skills"],
+            resume_text=retrieval_profile_text(profile), job_text=job["description"], resume_skills=profile["skills"],
             job_weights=job["weights"], cand_years=profile["exp_years"], req_years=job["req_years"])
     advice = ctx.advisor.generate_advice(profile["skills"], job["weights"], job_title=job["title"],
                                          score_lifts=ev["skill_lifts"])

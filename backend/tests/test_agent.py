@@ -119,7 +119,7 @@ def test_fixed_pipeline_produces_a_ranked_report_with_a_full_trace(db_factory):
     assert report["matches"][-1]["title"] == "Marketing Lead"
     assert report["profile"]["domains"][0]["family"] == "DevOps, SRE and Cloud"
     assert {p["provider"] for p in report["data_sources"]["providers"]} == {"Test Feed", "Other Feed"}
-    assert "never logs in to, or scrapes, LinkedIn or Indeed" in report["data_sources"]["policy"]
+    assert "does not log in to or directly scrape those board sites" in report["data_sources"]["policy"]
     assert report["narrative"]["mode"] == "template" and report["market"]["jobs_ranked"] == 4
     json.dumps(result)                                             # the whole run is serialisable
 
@@ -232,8 +232,11 @@ def test_a_missing_explicit_resume_is_not_replaced_by_another(db_factory):
 
 # ---------------------------------------------------------------- the API
 @pytest.fixture
-def client(db_factory):
-    with TestClient(main.app) as c:
+def client(db_factory, monkeypatch):
+    import dataclasses
+    test_token = "test-token-for-local-api-tests-0123456789"
+    monkeypatch.setattr(main, "settings", dataclasses.replace(main.settings, api_token=test_token, environment="test"))
+    with TestClient(main.app, headers={"Authorization": f"Bearer {test_token}"}) as c:
         yield c
 
 
@@ -254,3 +257,15 @@ def test_the_endpoint_requires_the_token_when_one_is_set(client, monkeypatch):
     monkeypatch.setattr(main, "settings", dataclasses.replace(main.settings, api_token="tok"))
     assert client.post("/api/v1/agent/run").status_code == 401
     assert client.post("/api/v1/agent/run", headers={"Authorization": "Bearer tok"}, data={"narrative": "off"}).status_code == 200
+
+def test_only_frontend_source_files_are_served(client):
+    panel = client.get("/frontend/src/AgentPanel.jsx")
+    assert panel.status_code == 200
+    assert "window.AgentPanel" in panel.text
+    assert client.get("/frontend/src/App.jsx").status_code == 200
+    assert client.get("/frontend/src/styles.css").status_code == 200
+    for private in ("/frontend/package.json", "/frontend/tests/harness.cjs", "/frontend/node_modules/react/package.json"):
+        assert client.get(private).status_code == 404
+    page = client.get("/")
+    assert page.status_code == 200
+    assert page.text.index("AgentPanel.jsx") < page.text.index("App.jsx")

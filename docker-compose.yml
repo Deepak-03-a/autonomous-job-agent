@@ -31,8 +31,10 @@ services:
       dockerfile: backend/Dockerfile
     environment: &app-environment
       PYTHONUNBUFFERED: "1"
+      APP_ENV: production
       DATABASE_URL: postgresql://talentalign:${POSTGRES_PASSWORD:-talentalign-local}@postgres:5432/talentalign
-      TALENTALIGN_API_TOKEN: ${TALENTALIGN_API_TOKEN:-}
+      TALENTALIGN_API_TOKEN: ${TALENTALIGN_API_TOKEN:?Set TALENTALIGN_API_TOKEN in .env}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-10m}

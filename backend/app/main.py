@@ -2,6 +2,7 @@ import os
 import json
 import secrets
 import threading
+from contextlib import asynccontextmanager
 from datetime import date
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -25,21 +26,48 @@ from adapters.llm.embeddings import MiniLMEmbedder
 from adapters.llm.ollama import OllamaClient
 from app.services.context import AgentContext
 from app.services.grounding import evidence_grounded
-from app.services.ranking import job_payload, load_profile, rank_market as rank_market_for
+from app.services.ranking import (
+    job_payload, load_profile, rank_market as rank_market_for, retrieval_profile_text,
+)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not settings.api_token:
+        raise RuntimeError("Set TALENTALIGN_API_TOKEN before starting the API.")
+    if len(settings.api_token) < 32:
+        raise RuntimeError("TALENTALIGN_API_TOKEN must contain at least 32 characters.")
+    if settings.api_token == "replace-with-a-long-random-token":
+        raise RuntimeError("Replace the example TALENTALIGN_API_TOKEN with a private random value.")
+    if (settings.environment not in {"development", "test"}
+            and not settings.database_url.startswith("postgresql")):
+        raise RuntimeError("Deployments must use PostgreSQL; SQLite is reserved for tests/development.")
+    if "*" in settings.cors_origins:
+        raise RuntimeError("CORS_ORIGINS must list explicit origins; wildcard CORS is disabled.")
+    if POSTGRES_STORE is not None:
+        for migration in POSTGRES_MIGRATIONS:
+            POSTGRES_STORE.migrate(migration)
+    else:
+        init_db()
+    warmer = threading.Thread(target=matcher_agent.warm_embedder, daemon=True)
+    warmer.start()
+    yield
+
 
 app = FastAPI(
     title="Autonomous Multi-Agent Job Alignment & Career Portal",
     description="SASTRA Deemed University MCA Capstone Project (CAPOL601R01) - Master Production Edition",
-    version="2.5.0"
+    version="2.5.0",
+    lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.cors_origins),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 APP_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_ROOT.parent
@@ -62,13 +90,16 @@ MAX_EXPORT_BYTES = int(os.getenv("MAX_EXPORT_BYTES", str(25 * 1024 * 1024)))
 if STATIC_ROOT.exists():
     app.mount("/static", StaticFiles(directory=STATIC_ROOT), name="static")
 if FRONTEND_ROOT.exists():
-    app.mount("/frontend", StaticFiles(directory=FRONTEND_ROOT), name="frontend")
+    # Serve only the page source, not package metadata, tests, or dependencies.
+    app.mount("/frontend/src", StaticFiles(directory=FRONTEND_ROOT / "src"), name="frontend")
 
 
 @app.middleware("http")
-async def optional_api_token(request: Request, call_next):
-    """Require a server-side bearer token or a valid hashed browser session."""
-    if settings.api_token and request.url.path.startswith("/api/"):
+async def required_api_token(request: Request, call_next):
+    """Fail closed when the API secret is missing; accept bearer or DB session."""
+    if request.url.path.startswith("/api/"):
+        if not settings.api_token:
+            return JSONResponse({"detail": "The server has no TALENTALIGN_API_TOKEN configured."}, status_code=503)
         bearer = request.headers.get("authorization", "")
         cookie = request.cookies.get("talentalign_session", "")
         authorized = (
@@ -78,17 +109,6 @@ async def optional_api_token(request: Request, call_next):
         if not authorized:
             return JSONResponse({"detail": "A valid bearer token is required."}, status_code=401)
     return await call_next(request)
-
-@app.on_event("startup")
-def startup_event():
-    if POSTGRES_STORE is not None:
-        for migration in POSTGRES_MIGRATIONS:
-            POSTGRES_STORE.migrate(migration)
-    else:
-        init_db()
-    # The embedding model is optional. Warm it in the background so the API
-    # answers immediately and falls back to word overlap if the download fails.
-    threading.Thread(target=matcher_agent.warm_embedder, daemon=True).start()
 
 parser_agent = ResumeParserAgent()
 crawler_agent = EthicalCrawlerAgent()
@@ -318,6 +338,8 @@ async def import_linkedin_export(file: UploadFile = File(...), resume_id: int | 
         "saved_jobs": profile.saved_jobs[:200],
         "applications": profile.applications[:200],
         "experience_source": combined.experience_source,
+        "headline": profile.headline,
+        "positions": [{"title": p.title, "company": p.company} for p in profile.positions[:25]],
     }
     if POSTGRES_STORE is not None:
         new_id = POSTGRES_STORE.insert_resume(filename, parsed, 1, extras=extras)
@@ -367,7 +389,7 @@ def discover_live_market(
         if not resume:
             market_jobs = []
         else:
-            query_embedding = RESUME_EMBEDDER.encode([resume["raw_text"]])[0]
+            query_embedding = RESUME_EMBEDDER.encode([retrieval_profile_text(resume)])[0]
             market_jobs = POSTGRES_STORE.search_jobs_by_embedding(query_embedding, country, limit=100)
         return {
             "status": "success",

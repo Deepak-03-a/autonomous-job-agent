@@ -24,7 +24,9 @@ class JSearchSource:
         self.queries = queries or _queries_from_environment(country)
         self.policy = SourcePolicy(
             "JSearch multi-board", min_interval_s=900, max_runs_per_day=4,
-            attribution="Original job-board publisher", check_robots=False,
+            # This adapter calls the licensed JSearch API; it does not fetch the
+            # publisher's pages, so robots.txt applies to the aggregator endpoint.
+            attribution="JSearch API with original publisher attribution", check_robots=False,
         )
 
     def fetch(self, since: datetime | None = None) -> list[JobPosting]:

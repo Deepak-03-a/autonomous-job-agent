@@ -137,6 +137,7 @@ class PostgresApplicationStore:
                         application_url = EXCLUDED.application_url,
                         provider = EXCLUDED.provider,
                         is_startup = EXCLUDED.is_startup,
+                        work_mode = EXCLUDED.work_mode,
                         posted_at = EXCLUDED.posted_at,
                         last_seen = now(),
                         status = 'open',
@@ -150,7 +151,7 @@ class PostgresApplicationStore:
                         job["title"],
                         job.get("location", ""),
                         job.get("country", country),
-                        "remote" if job.get("remote") else "onsite_or_hybrid",
+                        job.get("work_mode") or ("remote" if job.get("remote") else "onsite_or_hybrid"),
                         job.get("description", ""),
                         job.get("req_years", 0.0),
                         json.dumps(job.get("weights", {})),
@@ -171,7 +172,7 @@ class PostgresApplicationStore:
         with self._connect() as connection:
             row = connection.execute(
                 """SELECT id, external_id, title, company_id AS company, careers_url AS url,
-                          description, req_years, weights, location, country,
+                          description, req_years, weights, location, country, work_mode,
                           provider AS source, company_website, careers_url,
                           application_url, provider, is_startup,
                           posted_at
@@ -224,7 +225,7 @@ class PostgresApplicationStore:
         with self._connect() as connection:
             row = connection.execute(
                 """SELECT id, external_id, title, company_id AS company, careers_url AS url,
-                          description, req_years, weights, location, country,
+                          description, req_years, weights, location, country, work_mode,
                           provider AS source, company_website, careers_url,
                           application_url, provider, is_startup,
                           posted_at
@@ -236,7 +237,7 @@ class PostgresApplicationStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """SELECT id, external_id, title, company_id AS company, careers_url AS url,
-                          description, req_years, weights, location, country,
+                          description, req_years, weights, location, country, work_mode,
                           provider AS source, company_website, careers_url,
                           application_url, provider, is_startup,
                           posted_at
@@ -249,21 +250,45 @@ class PostgresApplicationStore:
         embedding: list[float],
         country: str = "",
         limit: int = 100,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        filters = filters or {}
+        clauses = ["status = 'open'", "careers_url <> ''"]
+        params: list[Any] = []
+        if country:
+            clauses.append("(location ILIKE %s OR country ILIKE %s OR work_mode = 'remote')")
+            params.extend([f"%{country}%", f"%{country}%"])
+        if filters.get("remote_only"):
+            clauses.append("work_mode = 'remote'")
+        if filters.get("location_contains"):
+            clauses.append("location ILIKE %s")
+            params.append(f"%{filters['location_contains']}%")
+        if filters.get("company_contains"):
+            clauses.append("company_id ILIKE %s")
+            params.append(f"%{filters['company_contains']}%")
+        if "max_required_years" in filters:
+            clauses.append("req_years <= %s")
+            params.append(filters["max_required_years"])
+        if filters.get("must_have_skill"):
+            clauses.append(
+                "EXISTS (SELECT 1 FROM jsonb_object_keys(weights) AS skill_names(skill) "
+                "WHERE lower(skill_names.skill) = lower(%s))"
+            )
+            params.append(filters["must_have_skill"])
+        params.extend([embedding, min(max(int(limit), 1), 500)])
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT id, external_id, title, company_id AS company, careers_url AS url,
                        description, req_years, weights, location, country,
-                       provider AS source, company_website, careers_url,
+                       work_mode, provider AS source, company_website, careers_url,
                        application_url, provider, is_startup, posted_at
                 FROM jobs
-                WHERE status = 'open' AND careers_url <> ''
-                  AND (%s = '' OR location ILIKE %s OR country ILIKE %s OR work_mode = 'remote')
+                WHERE {' AND '.join(clauses)}
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
-                (country, f"%{country}%", f"%{country}%", embedding, limit),
+                params,
             ).fetchall()
             return [self._format_job(row) for row in rows]
 

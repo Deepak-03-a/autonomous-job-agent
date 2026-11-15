@@ -7,3 +7,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+backend/job_agent.db
+backend/job_agent.db
+
+# Frontend test dependencies
+node_modules/

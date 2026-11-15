@@ -199,9 +199,12 @@ def combine(resume_text: str, resume_skills: list[str], resume_years: float | No
     skills = list(dict.fromkeys(resume_skills))
     extra: list[str] = []
     for name in profile.skills:
-        if name.casefold() in SKILL_TAXONOMY_WEIGHTS:
-            skills.append(name.casefold())
-        else:
+        normalized = name.strip().casefold()
+        if normalized:
+            # Preserve every explicit LinkedIn skill. Exact name intersections
+            # can then contribute to scoring when a job adapter supplies it.
+            skills.append(normalized)
+        if normalized not in SKILL_TAXONOMY_WEIGHTS:
             extra.append(name)
     skills += extract_skills_from_text(linkedin_text)
 

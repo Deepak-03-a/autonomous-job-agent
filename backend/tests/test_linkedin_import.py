@@ -132,8 +132,11 @@ def test_other_fields_and_empty_profiles():
 # ------------------------------------------------------------------- the API
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    import dataclasses
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "t.db"))
-    with TestClient(main.app) as c:
+    test_token = "test-token-for-local-api-tests-0123456789"
+    monkeypatch.setattr(main, "settings", dataclasses.replace(main.settings, api_token=test_token, environment="test"))
+    with TestClient(main.app, headers={"Authorization": f"Bearer {test_token}"}) as c:
         yield c
 
 

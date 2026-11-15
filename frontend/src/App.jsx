@@ -17,7 +17,7 @@ function apiUrl(path) { return `${API_BASE_URL}${path}`; }
 
 async function requestJson(path, options) {
   const headers = new Headers(options?.headers || {});
-  const response = await fetch(apiUrl(path), { ...options, headers });
+  const response = await fetch(apiUrl(path), { ...options, headers, credentials: "include" });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(payload.detail || "The request could not be completed.");
   return payload;
@@ -56,7 +56,7 @@ function App() {
   const [chatLoading, setChatLoading] = useState(false);
 
   useEffect(() => {
-    fetch(apiUrl("/health"), { signal: AbortSignal.timeout(5000) })
+    fetch(apiUrl("/health"), { signal: AbortSignal.timeout(5000), credentials: "include" })
       .then((response) => setBackendOffline(!response.ok))
       .catch(() => setBackendOffline(true));
   }, []);
@@ -132,11 +132,12 @@ function App() {
     finally { setLoading(false); }
   }
 
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <a className="brand" href="#top"><span className="brand-mark">T</span><span>talent<span>align</span></span></a>
-        <nav className="nav-links"><a className="active" href="#discover">Discover jobs</a><a href="#insights">Career insights</a><a href="#applications">Applications</a></nav>
+        <nav className="nav-links"><a className="active" href="#discover">Discover jobs</a><a href="#agent">Job agent</a><a href="#insights">Career insights</a><a href="#applications">Applications</a></nav>
         <div className="topbar-actions"><button className="ghost-button" type="button" onClick={() => fileRef.current?.click()}>Upload resume</button><div className="avatar">RK</div></div>
       </header>
       {backendOffline && <div className="offline-banner">The Linux backend is offline or unreachable. Wake the host or check the Tailscale connection.</div>}
@@ -159,6 +160,18 @@ function App() {
 
             <aside className="detail-panel" id="insights"><div className="detail-label">Selected opportunity</div><div className="detail-company"><div className="company-logo large">{initials(activeDetails.company_name || activeDetails.company)}</div><div><strong>{activeDetails.company_name || activeDetails.company || "Your next role"}</strong><span>{activeDetails.source || "Personalized feed"}</span></div></div><h2>{activeDetails.role_title || activeDetails.title || "Discover your next role"}</h2><div className="detail-location">⌖ {activeDetails.location || "India · Nationwide"}</div><div className="fit-card"><div className="fit-ring"><span>{activeEvaluation.final_match_score_pct ? Math.round(activeEvaluation.final_match_score_pct) : "—"}</span><small>%</small></div><div><strong>{activeEvaluation.match_tier || "Awaiting your resume"}</strong><p>{activeEvaluation.score_story || "Search the market to see why a role fits you."}</p></div></div><div className="detail-section"><div className="detail-section-title">Why this role</div><p>{activeDetails.description || "Your personalized role summary will appear here after discovery."}</p></div><div className="detail-section"><div className="detail-section-title">Your edge</div><div className="skill-list">{(activeAdvice.matched_skills || Object.keys(activeDetails.weights || {}).slice(0, 4)).slice(0, 4).map((skill) => <span key={skill}>✓ {skill}</span>)}</div></div><a className="apply-button" href={activeDetails.careers_url || activeDetails.company_website || activeDetails.portal_url || "#"} target="_blank" rel="noreferrer">Visit official company careers <span>↗</span></a><div className="safe-note">↗ You’ll apply on the original employer careers page.</div><div className="detail-section chat-section"><div className="detail-section-title">Ask about this match</div><form onSubmit={askAssistant}><input value={chatQuestion} onChange={(event) => setChatQuestion(event.target.value)} maxLength={1000} placeholder="Why does this role fit me?" aria-label="Ask about this job match" /><button type="submit" disabled={chatLoading || !activeJob}>{chatLoading ? "Thinking…" : "Ask"}</button></form>{chatAnswer && <p className="chat-answer" aria-live="polite">{chatAnswer}</p>}<div className="chat-caption">Answers use your saved resume and job details.</div></div></aside>
           </div>
+        </section>
+        <section className="content-wrap">
+          {window.AgentPanel && (
+            <window.AgentPanel
+              request={requestJson}
+              onProfileChanged={(data) => {
+                setResumeId(data.resume_id);
+                setResume({ filename: data.filename, detected_skills: data.skills });
+                setNotice(`${data.filename} is ready. Run discovery or the agent to see your matches.`);
+              }}
+            />
+          )}
         </section>
       </main>
       <footer className="footer"><span>talent<span>align</span></span><span>Built for better next chapters.</span><span>© 2026 TalentAlign AI</span></footer>

@@ -6,8 +6,12 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Settings:
+    environment: str = os.getenv("APP_ENV", "production").strip().lower()
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///job_agent.db")
     api_token: str = os.getenv("TALENTALIGN_API_TOKEN", "")
+    cors_origins: tuple[str, ...] = tuple(
+        origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()
+    )
     ollama_url: str = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
     ollama_keep_alive: str = os.getenv("OLLAMA_KEEP_ALIVE", "10m")

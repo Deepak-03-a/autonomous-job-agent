@@ -18,6 +18,8 @@ from adapters.sources.greenhouse import GreenhouseSource
 from adapters.sources.lever import LeverSource
 from adapters.sources.public_market import PublicMarketSource
 from adapters.sources.jsearch import JSearchSource
+from adapters.sources.ashby import AshbySource
+from adapters.sources.smartrecruiters import SmartRecruitersSource
 from adapters.sources.protocol import JobSource
 from core.config import settings
 
@@ -82,6 +84,10 @@ def configured_sources() -> list[JobSource]:
             sources.append(GreenhouseSource(entry["board"], entry["name"], entry["careers_url"], entry["company_website"]))
         elif provider == "lever":
             sources.append(LeverSource(entry["board"], entry["name"], entry["careers_url"], entry["company_website"]))
+        elif provider == "ashby":
+            sources.append(AshbySource(entry["board"], entry["name"], entry["careers_url"], entry["company_website"]))
+        elif provider == "smartrecruiters":
+            sources.append(SmartRecruitersSource(entry["board"], entry["name"], entry["careers_url"], entry["company_website"]))
         elif provider == "feed":
             sources.append(OfficialFeedSource(entry["name"], entry["feed_url"], entry["careers_url"], entry["company_website"]))
         elif provider == "adzuna":
