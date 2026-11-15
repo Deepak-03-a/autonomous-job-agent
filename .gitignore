@@ -1,14 +1,33 @@
-backend/venv/
+# Python environments and generated files
 venv/
 .venv/
+ENV/
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environment and secrets
 .env
 .env.*
 !.env.example
-backend/job_agent.db
-backend/job_agent.db
 
-# Frontend test dependencies
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# JavaScript dependencies and build output
 node_modules/
+frontend/dist/
+
+# Logs and OS metadata
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
